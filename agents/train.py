@@ -31,6 +31,7 @@ model = PPO(
     verbose=1,
     tensorboard_log=LOG_DIR,
     learning_rate=3e-4,
+    ent_coef=0.01,
     vf_coef=0.25,
     max_grad_norm=0.5,
     n_steps=512,
