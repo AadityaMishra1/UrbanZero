@@ -112,6 +112,8 @@ class CarlaEnv(gym.Env):
         self.prev_action = np.array([0.0, 0.0], dtype=np.float32)
         self.stagnation_counter = 0
         self.route_progress = 0.0
+        self._prev_seg_t = 0.0
+        self._prev_seg_idx = 0
 
         # Weather randomization
         if self.enable_weather_randomization:
@@ -242,26 +244,61 @@ class CarlaEnv(gym.Env):
         self.total_route_length = max(self.total_route_length, 1.0)  # avoid div by zero
 
     def _advance_route_index(self):
-        """Advance the route index to the nearest waypoint ahead of the vehicle."""
-        if not self.route:
+        """Compute continuous route progress — not just at waypoint crossings.
+
+        The old version only returned non-zero progress_delta when the vehicle
+        fully crossed a waypoint (2m apart).  This made the reward sparse:
+        at low speeds the agent was truncated by stagnation before ever
+        reaching the next waypoint, so it never experienced the primary
+        reward signal.  Now we measure the projection onto the current
+        route segment so every meter of forward movement is rewarded.
+        """
+        if not self.route or self.route_index >= len(self.route) - 1:
             return 0.0
 
         ego_loc = self.vehicle.get_location()
         progress_delta = 0.0
 
-        # Look ahead from current index, advance past waypoints we've passed
+        # Advance past any fully-crossed waypoints
         while self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
             next_wp_loc = self.route[self.route_index + 1].transform.location
             dist_to_next = ego_loc.distance(next_wp_loc)
             dist_between = wp_loc.distance(next_wp_loc)
 
-            # If we're closer to the next waypoint than the current, advance
             if ego_loc.distance(wp_loc) > dist_between * 0.5 and dist_to_next < dist_between * 1.5:
                 progress_delta += dist_between
                 self.route_index += 1
             else:
                 break
+
+        # Continuous progress within the current segment: project ego
+        # position onto the line from current wp to next wp.
+        if self.route_index < len(self.route) - 1:
+            wp_loc = self.route[self.route_index].transform.location
+            next_wp_loc = self.route[self.route_index + 1].transform.location
+            # Segment vector
+            sx = next_wp_loc.x - wp_loc.x
+            sy = next_wp_loc.y - wp_loc.y
+            seg_len_sq = sx * sx + sy * sy
+            if seg_len_sq > 0.01:
+                # Projection of ego onto segment [0, 1]
+                t = ((ego_loc.x - wp_loc.x) * sx + (ego_loc.y - wp_loc.y) * sy) / seg_len_sq
+                t = max(0.0, min(1.0, t))
+                seg_len = math.sqrt(seg_len_sq)
+                # Track how much the projection advanced since last step
+                if not hasattr(self, '_prev_seg_t'):
+                    self._prev_seg_t = 0.0
+                    self._prev_seg_idx = self.route_index
+                if self._prev_seg_idx == self.route_index:
+                    dt = t - self._prev_seg_t
+                    if dt > 0:
+                        progress_delta += dt * seg_len
+                else:
+                    # Crossed into new segment — count progress from start
+                    progress_delta += t * seg_len
+                self._prev_seg_t = t
+                self._prev_seg_idx = self.route_index
 
         return progress_delta
 
@@ -309,8 +346,9 @@ class CarlaEnv(gym.Env):
             angle_diff = abs(vehicle_yaw - wp_yaw) % 360
             if angle_diff > 180:
                 angle_diff = 360 - angle_diff
-            # Reward for being well-aligned (max 0.1 when perfectly aligned)
-            heading_reward = 0.1 * (1.0 - angle_diff / 180.0)
+            # Reward for being well-aligned (max 0.02 when perfectly aligned).
+            # Kept small so "sit still and face the road" isn't a viable strategy.
+            heading_reward = 0.02 * (1.0 - angle_diff / 180.0)
 
         # 5. Action smoothness penalty (CAPS-style)
         steer = action[0]
