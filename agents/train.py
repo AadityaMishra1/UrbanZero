@@ -104,8 +104,21 @@ def main():
     # stacks along the wrong axis (width instead of channels).
     env = VecFrameStack(env, n_stack=4, channels_order={"image": "first", "state": "last"})
 
-    # Reward normalization (don't normalize obs — we handle that in the env)
-    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+    # Reward normalization (don't normalize obs — we handle that in the env).
+    # When resuming, load saved VecNormalize stats so the agent sees the same
+    # reward distribution it was trained on — otherwise GAE advantages become
+    # invalid and training destabilizes.
+    if args.resume:
+        vecnorm_path = os.path.join(os.path.dirname(args.resume), "vecnormalize.pkl")
+        if os.path.exists(vecnorm_path):
+            env = VecNormalize.load(vecnorm_path, env)
+            env.training = True
+            print(f"  Loaded VecNormalize stats from {vecnorm_path}")
+        else:
+            print(f"  Warning: {vecnorm_path} not found, using fresh VecNormalize")
+            env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+    else:
+        env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
     # Callbacks
     checkpoint_cb = CheckpointCallback(

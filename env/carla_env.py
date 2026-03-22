@@ -150,32 +150,41 @@ class CarlaEnv(gym.Env):
         self.collision_sensor = self.world.spawn_actor(col_bp, carla.Transform(), attach_to=self.vehicle)
         self.collision_sensor.listen(lambda e: self.collision_history.append(e))
 
-        # Spawn traffic
-        if self.enable_traffic:
-            self._spawn_traffic()
-
-        # Wait for first image
+        # Wait for first image BEFORE spawning traffic — if traffic spawns
+        # first, NPCs can collide with the ego vehicle during the image wait,
+        # terminating the episode before the agent ever acts.
         for _ in range(30):
             self.world.tick()
             if self.image is not None:
                 break
             time.sleep(0.01)
 
+        if self.image is None:
+            print("[warning] camera did not deliver a frame after 30 ticks")
+
+        # Spawn traffic after ego is settled and camera is active
+        if self.enable_traffic:
+            self._spawn_traffic()
+
         return self._get_obs(), {}
 
     def step(self, action):
         self.step_count += 1
 
-        # Apply action
+        # Apply action (with deadzone to prevent throttle/brake oscillation)
         steer = float(np.clip(action[0], -1.0, 1.0))
         throttle_brake = float(np.clip(action[1], -1.0, 1.0))
-        if throttle_brake >= 0:
+        if throttle_brake > 0.05:
             self.vehicle.apply_control(carla.VehicleControl(
                 throttle=throttle_brake, steer=steer, brake=0.0
             ))
-        else:
+        elif throttle_brake < -0.05:
             self.vehicle.apply_control(carla.VehicleControl(
                 throttle=0.0, steer=steer, brake=-throttle_brake
+            ))
+        else:
+            self.vehicle.apply_control(carla.VehicleControl(
+                throttle=0.0, steer=steer, brake=0.0
             ))
 
         self.world.tick()
@@ -392,14 +401,22 @@ class CarlaEnv(gym.Env):
                 wp_features[i * 2] = dx_ego / 20.0
                 wp_features[i * 2 + 1] = dy_ego / 20.0
 
-        # Lane offset (signed distance to lane center)
+        # Lane offset (SIGNED distance to lane center)
+        # Positive = right of center, negative = left.  Gives the agent
+        # directional information so it knows WHICH way to steer.
         lane_offset = 0.0
         wp = self.map.get_waypoint(ego_loc, project_to_road=True,
                                     lane_type=carla.LaneType.Driving) if ego_loc else None
         if wp and ego_loc:
             wp_loc = wp.transform.location
-            lane_offset = math.sqrt((ego_loc.x - wp_loc.x)**2 + (ego_loc.y - wp_loc.y)**2)
-            lane_offset = min(lane_offset, 5.0) / 5.0  # normalize to [0, 1]
+            wp_yaw_rad = math.radians(wp.transform.rotation.yaw)
+            wp_fwd_x = math.cos(wp_yaw_rad)
+            wp_fwd_y = math.sin(wp_yaw_rad)
+            dx = ego_loc.x - wp_loc.x
+            dy = ego_loc.y - wp_loc.y
+            # Cross product of lane-forward × ego-offset = signed lateral distance
+            signed_offset = dx * wp_fwd_y - dy * wp_fwd_x
+            lane_offset = max(-1.0, min(1.0, signed_offset / 5.0))  # normalize to [-1, 1]
 
         # Traffic light state (one-hot: none=0, green=1, yellow=2, red=3)
         tl_state = 0.0
@@ -448,8 +465,9 @@ class CarlaEnv(gym.Env):
         array = array.reshape((IMG_H, IMG_W, 4))
         # CARLA BGRA layout: semantic class label is in R channel (index 2)
         labels = array[:, :, 2].astype(np.float32)
-        # Normalize to [0, 1] range
-        labels = labels / NUM_SEMANTIC_CLASSES
+        # Normalize to [0, 1] range.  Labels span [0, 27] so divide by 27
+        # (not 28) to map the highest class to exactly 1.0.
+        labels = labels / (NUM_SEMANTIC_CLASSES - 1)
         # Single channel: (1, H, W)
         self.image = labels[np.newaxis, :, :]
 
