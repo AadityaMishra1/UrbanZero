@@ -480,7 +480,7 @@ class CarlaEnv(gym.Env):
         self._destroy_traffic()
 
         try:
-            tm = self.client.get_trafficmanager(self.port + 6000)
+            tm = self.client.get_trafficmanager(self.port + 6000 + os.getpid() % 1000)
             tm.set_global_distance_to_leading_vehicle(2.5)
             tm.set_synchronous_mode(True)
             tm.set_random_device_seed(random.randint(0, 10000))
