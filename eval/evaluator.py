@@ -71,13 +71,13 @@ class DrivingMetricsCallback(BaseCallback):
         if self.n_calls % self.eval_freq == 0 and self.episode_route_completions:
             n_episodes = len(self.episode_route_completions)
 
-            avg_rc = np.mean(self.episode_route_completions[-n_episodes:])
-            avg_collisions = np.mean(self.episode_collisions[-n_episodes:])
-            avg_speed = np.mean(self.episode_speeds[-n_episodes:]) if self.episode_speeds else 0.0
-            avg_ep_len = np.mean(self.episode_lengths[-n_episodes:])
+            avg_rc = np.mean(self.episode_route_completions)
+            avg_collisions = np.mean(self.episode_collisions)
+            avg_speed = np.mean(self.episode_speeds) if self.episode_speeds else 0.0
+            avg_ep_len = np.mean(self.episode_lengths)
 
             # Driving Score approximation: RC * (1 - collision_rate)
-            collision_rate = np.mean([1 if c > 0 else 0 for c in self.episode_collisions[-n_episodes:]])
+            collision_rate = np.mean([1 if c > 0 else 0 for c in self.episode_collisions])
             approx_ds = avg_rc * (1.0 - collision_rate)
 
             self.logger.record("driving/route_completion", avg_rc)
@@ -89,10 +89,11 @@ class DrivingMetricsCallback(BaseCallback):
             self.logger.record("driving/num_episodes", n_episodes)
 
             if self.verbose > 0:
+                reliable = "" if n_episodes >= 20 else f" (LOW sample — {n_episodes} < 20)"
                 print(f"\n[Eval @ {self.num_timesteps} steps] "
                       f"RC={avg_rc:.2%} DS={approx_ds:.2%} "
                       f"Speed={avg_speed:.1f}m/s Collisions={avg_collisions:.1f} "
-                      f"EpLen={avg_ep_len:.0f} ({n_episodes} episodes)")
+                      f"EpLen={avg_ep_len:.0f} ({n_episodes} episodes){reliable}")
 
             # Reset accumulators
             self.episode_route_completions = []

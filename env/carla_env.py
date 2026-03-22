@@ -185,8 +185,8 @@ class CarlaEnv(gym.Env):
         self.prev_action = np.array([steer, throttle_brake], dtype=np.float32)
 
         truncated = self.step_count >= self.max_episode_steps
-        # Also truncate if stuck for too long
-        if self.stagnation_counter > 200:
+        # Also truncate if stuck for too long (6 seconds at 20Hz)
+        if self.stagnation_counter > 120:
             truncated = True
 
         info = {
@@ -311,14 +311,27 @@ class CarlaEnv(gym.Env):
         smoothness_penalty = -0.05 * (steer_delta + 0.3 * throttle_delta)
 
         # 6. Stagnation tracking
-        if speed < 0.1:
+        # 0.5 m/s threshold: prevents the agent from gaming stagnation by
+        # creeping at 0.1 m/s.  Legitimate stops at red/yellow lights are
+        # exempted so the agent can learn to obey traffic signals.
+        at_red_light = False
+        if self.vehicle and self.vehicle.is_at_traffic_light():
+            tl = self.vehicle.get_traffic_light()
+            if tl and tl.get_state() in (carla.TrafficLightState.Red,
+                                         carla.TrafficLightState.Yellow):
+                at_red_light = True
+
+        if speed < 0.5 and not at_red_light:
             self.stagnation_counter += 1
         else:
-            self.stagnation_counter = 0
+            # Gradual decay instead of instant reset — brief movement
+            # shouldn't erase a long stagnation history.
+            self.stagnation_counter = max(0, self.stagnation_counter - 2)
 
         stagnation_penalty = 0.0
         if self.stagnation_counter > 40:  # 2 seconds of being stuck
-            stagnation_penalty = -0.3
+            # Progressive: grows with duration, caps at 3× base penalty
+            stagnation_penalty = -0.3 * min(self.stagnation_counter / 40.0, 3.0)
 
         # Combine reward
         reward = progress_reward + speed_reward + lane_penalty + heading_reward + smoothness_penalty + stagnation_penalty
@@ -506,20 +519,33 @@ class CarlaEnv(gym.Env):
             print(f"Warning: traffic spawning failed: {e}")
 
     def _destroy_traffic(self):
-        """Clean up all spawned traffic actors."""
-        # Stop pedestrian controllers first
+        """Clean up all spawned traffic actors.
+
+        Controllers must be stopped and destroyed before their parent walkers,
+        so we split the pedestrian list into controllers vs walkers and handle
+        them in the correct order.
+        """
+        controllers = []
+        walkers = []
         for actor in self.pedestrian_actors:
             try:
                 if actor.type_id == "controller.ai.walker":
                     actor.stop()
+                    controllers.append(actor)
+                else:
+                    walkers.append(actor)
             except Exception:
                 pass
 
-        for actor in self.traffic_actors + self.pedestrian_actors:
-            try:
-                actor.destroy()
-            except Exception:
-                pass
+        # Destroy controllers first (children before parents)
+        if controllers:
+            self._batch_destroy(controllers, label="ped-controllers")
+
+        # Then destroy walkers + traffic vehicles together
+        remaining = self.traffic_actors + walkers
+        if remaining:
+            self._batch_destroy(remaining, label="traffic")
+
         self.traffic_actors = []
         self.pedestrian_actors = []
 
@@ -574,16 +600,66 @@ class CarlaEnv(gym.Env):
         return math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
 
     def _destroy_actors(self):
+        """Destroy ego vehicle, sensors, and all traffic.
+
+        In synchronous mode, actor.destroy() queues the command but the server
+        only processes it on the next tick.  Without a tick the actor stays in
+        the world — this is the root cause of "ghost cars" accumulating across
+        episodes.  We use apply_batch_sync for reliability and tick afterward.
+        """
+        # Stop sensor listeners *before* destroying to prevent callbacks
+        # firing on a half-destroyed actor.
+        if self.camera is not None:
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
+        if self.collision_sensor is not None:
+            try:
+                self.collision_sensor.stop()
+            except Exception:
+                pass
+
         self._destroy_traffic()
-        for actor in [self.camera, self.collision_sensor, self.vehicle]:
-            if actor is not None:
+
+        # Batch-destroy ego actors (sensors first, then vehicle)
+        ego_actors = [a for a in [self.camera, self.collision_sensor, self.vehicle]
+                      if a is not None]
+        if ego_actors:
+            self._batch_destroy(ego_actors, label="ego")
+
+        self.vehicle = None
+        self.camera = None
+        self.collision_sensor = None
+
+    def _batch_destroy(self, actors, label=""):
+        """Batch-destroy a list of actors and tick so the server processes it.
+
+        Falls back to individual destroy() calls if the batch command fails.
+        """
+        if not actors:
+            return
+
+        batch = [carla.command.DestroyActor(a) for a in actors]
+        try:
+            responses = self.client.apply_batch_sync(batch)
+            for i, resp in enumerate(responses):
+                if resp.error:
+                    print(f"[cleanup:{label}] failed to destroy "
+                          f"{actors[i].type_id} id={actors[i].id}: {resp.error}")
+        except Exception as e:
+            print(f"[cleanup:{label}] batch destroy failed, falling back: {e}")
+            for actor in actors:
                 try:
                     actor.destroy()
                 except Exception:
                     pass
-        self.vehicle = None
-        self.camera = None
-        self.collision_sensor = None
+
+        # Tick so the synchronous-mode server actually removes the actors.
+        try:
+            self.world.tick()
+        except Exception:
+            pass
 
     def close(self):
         settings = self.world.get_settings()

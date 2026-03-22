@@ -27,6 +27,7 @@ sys.path.append(PROJECT_ROOT)
 
 from env.carla_env import CarlaEnv
 from models.cnn_extractor import DrivingCNN
+from models.clamped_policy import ClampedStdPolicy
 from eval.evaluator import DrivingMetricsCallback
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecFrameStack
@@ -108,7 +109,7 @@ def main():
 
     # Callbacks
     checkpoint_cb = CheckpointCallback(
-        save_freq=max(10000 // args.n_envs, 1000),
+        save_freq=max(50000 // args.n_envs, 5000),
         save_path=CKPT_DIR,
         name_prefix="ppo_urbanzero",
         save_vecnormalize=True,
@@ -121,6 +122,7 @@ def main():
 
     # PPO with custom CNN extractor
     policy_kwargs = dict(
+        log_std_init=0.0,
         features_extractor_class=DrivingCNN,
         features_extractor_kwargs=dict(features_dim=256),
         net_arch=dict(pi=[256, 128], vf=[256, 128]),  # separate actor/critic heads
@@ -135,7 +137,7 @@ def main():
         model = PPO.load(args.resume, env=env, device="cuda" if torch.cuda.is_available() else "cpu")
     else:
         model = PPO(
-            "MultiInputPolicy",
+            ClampedStdPolicy,
             env,
             verbose=1,
             tensorboard_log=LOG_DIR,
@@ -145,7 +147,7 @@ def main():
             max_grad_norm=0.5,          # gradient clipping
             n_steps=n_steps,            # rollout length per env
             batch_size=batch_size,      # mini-batch size
-            n_epochs=10,                # PPO epochs per update
+            n_epochs=5,                # PPO epochs per update
             gamma=0.99,                 # discount factor
             gae_lambda=0.95,            # GAE lambda
             clip_range=0.2,             # PPO clipping range
