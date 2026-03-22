@@ -31,8 +31,41 @@ from models.clamped_policy import ClampedStdPolicy
 from eval.evaluator import DrivingMetricsCallback
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecFrameStack
-from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
+from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList, BaseCallback
 import torch
+import time as _time
+
+
+class WallClockCheckpointCallback(BaseCallback):
+    """Save a checkpoint every N wall-clock minutes, independent of step count.
+
+    This catches the failure mode where SB3's step-based CheckpointCallback
+    stops firing (e.g. step counter drift, hung episodes) — the model still
+    gets saved on a real-time schedule so you never lose more than N minutes
+    of training to a crash.
+    """
+
+    def __init__(self, save_path, save_minutes=10, verbose=0):
+        super().__init__(verbose)
+        self.save_path = save_path
+        self.save_interval = save_minutes * 60
+        self._last_save_time = _time.time()
+
+    def _on_step(self) -> bool:
+        now = _time.time()
+        elapsed = now - self._last_save_time
+        if elapsed >= self.save_interval:
+            path = os.path.join(self.save_path, f"autosave_{self.num_timesteps}_steps")
+            self.model.save(path)
+            if hasattr(self.training_env, "save"):
+                self.training_env.save(
+                    os.path.join(self.save_path, "vecnormalize.pkl")
+                )
+            if self.verbose > 0:
+                print(f"\n[autosave @ {self.num_timesteps} steps, "
+                      f"{elapsed / 60:.1f}min since last save]")
+            self._last_save_time = now
+        return True
 
 
 def parse_args():
@@ -131,7 +164,13 @@ def main():
         eval_freq=max(20000 // args.n_envs, 2000),
         verbose=1,
     )
-    callbacks = CallbackList([checkpoint_cb, metrics_cb])
+    # Wall-clock checkpoint: saves every 10 minutes regardless of step count,
+    # so a crash never loses more than 10 minutes of training even if the
+    # step-based CheckpointCallback stops firing.
+    wallclock_cb = WallClockCheckpointCallback(
+        save_path=CKPT_DIR, save_minutes=10, verbose=1,
+    )
+    callbacks = CallbackList([checkpoint_cb, metrics_cb, wallclock_cb])
 
     # PPO with custom CNN extractor
     policy_kwargs = dict(
@@ -172,11 +211,23 @@ def main():
     print(f"Policy architecture:\n{model.policy}")
     print(f"\nStarting training for {args.timesteps:,} timesteps...")
 
-    model.learn(
-        total_timesteps=args.timesteps,
-        callback=callbacks,
-        progress_bar=True,
-    )
+    try:
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=callbacks,
+            progress_bar=True,
+        )
+    except Exception as e:
+        # Emergency save — don't lose weights that are sitting in GPU memory.
+        print(f"\n[CRASH] Training failed at {model.num_timesteps} steps: {e}")
+        try:
+            emergency_path = os.path.join(CKPT_DIR, f"emergency_{model.num_timesteps}_steps")
+            model.save(emergency_path)
+            env.save(os.path.join(CKPT_DIR, "vecnormalize.pkl"))
+            print(f"[CRASH] Emergency checkpoint saved to {emergency_path}")
+        except Exception as save_err:
+            print(f"[CRASH] Emergency save also failed: {save_err}")
+        raise
 
     # Save final model + VecNormalize stats
     final_path = os.path.join(CKPT_DIR, "final_model")
