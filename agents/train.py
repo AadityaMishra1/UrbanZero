@@ -186,20 +186,32 @@ def main():
 
     if args.resume:
         print(f"Resuming from: {args.resume}")
-        model = PPO.load(args.resume, env=env, device="cuda" if torch.cuda.is_available() else "cpu")
+        model = PPO.load(
+            args.resume,
+            env=env,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            # Override checkpoint's saved hyperparameters with current values.
+            # Without this, PPO.load() silently uses the old LR/epochs from the
+            # checkpoint, ignoring the tuned values above.
+            learning_rate=1e-4,
+            n_epochs=3,
+            ent_coef=0.01,
+            clip_range=0.2,
+            max_grad_norm=0.5,
+        )
     else:
         model = PPO(
             ClampedStdPolicy,
             env,
             verbose=1,
             tensorboard_log=LOG_DIR,
-            learning_rate=3e-4,
+            learning_rate=1e-4,             # reduced from 3e-4: stabilize KL/clip
             ent_coef=0.01,              # exploration (prevents std collapse)
             vf_coef=0.5,               # value function loss weight
             max_grad_norm=0.5,          # gradient clipping
             n_steps=n_steps,            # rollout length per env
             batch_size=batch_size,      # mini-batch size
-            n_epochs=5,                # PPO epochs per update
+            n_epochs=3,                # reduced from 5: fewer reuses of same data
             gamma=0.99,                 # discount factor
             gae_lambda=0.95,            # GAE lambda
             clip_range=0.2,             # PPO clipping range

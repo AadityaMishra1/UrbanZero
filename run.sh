@@ -16,7 +16,7 @@ SETUP='source ~/urbanzero_env/bin/activate && export PYTHONPATH=$PYTHONPATH:/mnt
 # Build training command
 LOGFILE="$HOME/urbanzero/logs/train_$(date +%Y%m%d_%H%M%S).log"
 if [ "${1:-}" = "resume" ]; then
-    TRAIN="$SETUP && cd ~/urbanzero && CKPT=\$(ls ~/urbanzero/checkpoints/shaped/*.zip 2>/dev/null | grep -v vecnormalize | sort | tail -1) && python3 -u agents/train.py --resume \"\$CKPT\" 2>&1 | tee $LOGFILE"
+    TRAIN="$SETUP && cd ~/urbanzero && CKPT=\$(ls ~/urbanzero/checkpoints/shaped/*.zip 2>/dev/null | grep -v vecnormalize | sort -V | tail -1) && python3 -u agents/train.py --resume \"\$CKPT\" 2>&1 | tee $LOGFILE"
 else
     TRAIN="$SETUP && cd ~/urbanzero && python3 -u agents/train.py 2>&1 | tee $LOGFILE"
 fi

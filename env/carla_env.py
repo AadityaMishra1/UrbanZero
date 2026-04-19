@@ -76,6 +76,39 @@ class CarlaEnv(gym.Env):
         self.map = self.world.get_map()
         self.blueprint_library = self.world.get_blueprint_library()
 
+        # Destroy all leftover actors from previous crashed/killed sessions.
+        # Must use batch + tick because the server may already be in sync mode
+        # from a previous session that didn't clean up properly.
+        # Order: stop controllers -> destroy controllers -> destroy sensors ->
+        #         destroy walkers -> destroy vehicles.
+        leftover_controllers = list(self.world.get_actors().filter("controller.*"))
+        for c in leftover_controllers:
+            try:
+                c.stop()
+            except Exception:
+                pass
+        leftover = (
+            leftover_controllers
+            + list(self.world.get_actors().filter("sensor.*"))
+            + list(self.world.get_actors().filter("walker.*"))
+            + list(self.world.get_actors().filter("vehicle.*"))
+        )
+        if leftover:
+            batch = [carla.command.DestroyActor(a) for a in leftover]
+            try:
+                self.client.apply_batch_sync(batch)
+            except Exception:
+                for a in leftover:
+                    try:
+                        a.destroy()
+                    except Exception:
+                        pass
+            # Tick to flush destructions (works whether server is sync or async)
+            try:
+                self.world.tick()
+            except Exception:
+                pass
+
         settings = self.world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 0.05  # 20 Hz
@@ -119,18 +152,61 @@ class CarlaEnv(gym.Env):
         if self.enable_weather_randomization:
             self.world.set_weather(random.choice(WEATHER_PRESETS))
 
-        # Spawn ego vehicle
+        # Spawn ego vehicle — only use spawn points on driving lanes (not sidewalks)
         bp = self.blueprint_library.filter("vehicle.tesla.model3")[0]
         spawn_points = self.map.get_spawn_points()
-        random.shuffle(spawn_points)
+        # Filter to spawn points that sit on a driving lane and have clear road ahead.
+        # We use project_to_road=True (snap to nearest driving lane) and then
+        # check the snap distance.  project_to_road=False is unreliable: it
+        # returns None unless the point is *exactly* inside a lane polygon,
+        # which most spawn points are not — causing the filter to reject
+        # everything and silently fall back to the unfiltered list.
+        valid_spawns = []
+        for sp in spawn_points:
+            wp = self.map.get_waypoint(sp.location, project_to_road=True,
+                                        lane_type=carla.LaneType.Driving)
+            if wp is None:
+                continue
+            # Must be very close to a driving lane (rejects sidewalks)
+            dist = sp.location.distance(wp.transform.location)
+            if dist > 1.5:
+                continue
+            # Spawn heading must match lane direction (rejects wrong-way spawns).
+            # Compare spawn yaw to waypoint yaw — reject if >60° off.
+            sp_yaw = sp.rotation.yaw
+            wp_yaw = wp.transform.rotation.yaw
+            yaw_diff = abs(sp_yaw - wp_yaw) % 360
+            if yaw_diff > 180:
+                yaw_diff = 360 - yaw_diff
+            if yaw_diff > 60:
+                continue
+            # Check that the road ahead isn't immediately blocked
+            nexts = wp.next(5.0)
+            if nexts:
+                valid_spawns.append(sp)
+        print(f"[spawn-filter] {len(valid_spawns)}/{len(spawn_points)} spawn points "
+              f"passed driving-lane filter")
+        if not valid_spawns:
+            print("[spawn-filter] WARNING: filter rejected ALL spawn points, "
+                  "using unfiltered list (this should not happen)")
+            valid_spawns = spawn_points  # fallback to all if filter too aggressive
+        random.shuffle(valid_spawns)
         self.vehicle = None
         start_sp = None
-        for sp in spawn_points:
+        spawn_failures = 0
+        for sp in valid_spawns:
             try:
                 self.vehicle = self.world.spawn_actor(bp, sp)
                 start_sp = sp
+                wp = self.map.get_waypoint(sp.location, project_to_road=True,
+                                            lane_type=carla.LaneType.Driving)
+                print(f"[spawn] spawned at ({sp.location.x:.1f}, {sp.location.y:.1f}, "
+                      f"{sp.location.z:.1f}), nearest driving wp dist={sp.location.distance(wp.transform.location):.2f}m, "
+                      f"lane={wp.lane_type}, road_id={wp.road_id}, lane_id={wp.lane_id} "
+                      f"(after {spawn_failures} failed attempts)")
                 break
             except RuntimeError:
+                spawn_failures += 1
                 continue
         if self.vehicle is None:
             raise RuntimeError("No free spawn point found")
@@ -196,8 +272,10 @@ class CarlaEnv(gym.Env):
         self.prev_action = np.array([steer, throttle_brake], dtype=np.float32)
 
         truncated = self.step_count >= self.max_episode_steps
-        # Also truncate if stuck for too long (6 seconds at 20Hz)
-        if self.stagnation_counter > 120:
+        # Blocked detector: 15 seconds (300 steps) of no meaningful
+        # progress.  Long enough that red light stops (~10s) don't
+        # trigger it, short enough that "sit still" isn't viable.
+        if self.stagnation_counter > 300:
             truncated = True
 
         info = {
@@ -244,22 +322,23 @@ class CarlaEnv(gym.Env):
         self.total_route_length = max(self.total_route_length, 1.0)  # avoid div by zero
 
     def _advance_route_index(self):
-        """Compute continuous route progress — not just at waypoint crossings.
+        """Compute continuous route progress along the planned route.
 
-        The old version only returned non-zero progress_delta when the vehicle
-        fully crossed a waypoint (2m apart).  This made the reward sparse:
-        at low speeds the agent was truncated by stagnation before ever
-        reaching the next waypoint, so it never experienced the primary
-        reward signal.  Now we measure the projection onto the current
-        route segment so every meter of forward movement is rewarded.
+        Projects ego position onto route segments for smooth per-step
+        progress measurement.  Careful to avoid double-counting: when
+        crossing a segment boundary, we subtract the portion of the old
+        segment that was already credited in previous steps.
         """
         if not self.route or self.route_index >= len(self.route) - 1:
             return 0.0
 
         ego_loc = self.vehicle.get_location()
         progress_delta = 0.0
+        old_seg_idx = self._prev_seg_idx
+        old_seg_t = self._prev_seg_t
 
         # Advance past any fully-crossed waypoints
+        first_crossing = True
         while self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
             next_wp_loc = self.route[self.route_index + 1].transform.location
@@ -267,35 +346,37 @@ class CarlaEnv(gym.Env):
             dist_between = wp_loc.distance(next_wp_loc)
 
             if ego_loc.distance(wp_loc) > dist_between * 0.5 and dist_to_next < dist_between * 1.5:
-                progress_delta += dist_between
+                if first_crossing and self.route_index == old_seg_idx:
+                    # First segment crossed: only credit the remaining
+                    # portion (1 - old_t) since [0, old_t] was already
+                    # rewarded in previous steps.
+                    progress_delta += dist_between * (1.0 - old_seg_t)
+                    first_crossing = False
+                else:
+                    progress_delta += dist_between
                 self.route_index += 1
             else:
                 break
 
-        # Continuous progress within the current segment: project ego
-        # position onto the line from current wp to next wp.
+        # Continuous progress within the current segment
         if self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
             next_wp_loc = self.route[self.route_index + 1].transform.location
-            # Segment vector
             sx = next_wp_loc.x - wp_loc.x
             sy = next_wp_loc.y - wp_loc.y
             seg_len_sq = sx * sx + sy * sy
             if seg_len_sq > 0.01:
-                # Projection of ego onto segment [0, 1]
                 t = ((ego_loc.x - wp_loc.x) * sx + (ego_loc.y - wp_loc.y) * sy) / seg_len_sq
                 t = max(0.0, min(1.0, t))
                 seg_len = math.sqrt(seg_len_sq)
-                # Track how much the projection advanced since last step
-                if not hasattr(self, '_prev_seg_t'):
-                    self._prev_seg_t = 0.0
-                    self._prev_seg_idx = self.route_index
                 if self._prev_seg_idx == self.route_index:
+                    # Same segment as last step — incremental progress
                     dt = t - self._prev_seg_t
                     if dt > 0:
                         progress_delta += dt * seg_len
                 else:
-                    # Crossed into new segment — count progress from start
+                    # Crossed into new segment — credit from start of
+                    # this segment only
                     progress_delta += t * seg_len
                 self._prev_seg_t = t
                 self._prev_seg_idx = self.route_index
@@ -309,58 +390,37 @@ class CarlaEnv(gym.Env):
         return min(self.route_progress / self.total_route_length, 1.0)
 
     # ------------------------------------------------------------------
-    # REWARD FUNCTION (GAP 3 fix — CaRL-inspired)
+    # REWARD FUNCTION — CaRL-style (route completion only)
+    #
+    # Based on CaRL (CoRL 2025): the state of the art uses route
+    # completion as the ONLY positive reward.  No speed reward, no
+    # heading reward, no lane centering.  Speed is emergent from
+    # wanting to complete more route.  Collision = episode termination,
+    # and the lost future reward IS the punishment.
     # ------------------------------------------------------------------
 
     def _compute_reward(self, action):
         speed = self._get_speed()
 
-        # 1. Route progress (PRIMARY signal — CaRL-style)
+        # 1. Route progress — the ONLY positive reward signal.
+        # Every meter of progress along the planned route = +1.0 reward.
+        # At target speed (8.3 m/s) this gives ~0.42/step.
         progress_delta = self._advance_route_index()
         self.route_progress += progress_delta
-        # Normalize: reward per meter of progress
-        progress_reward = progress_delta * 1.0
+        reward = progress_delta * 1.0
 
-        # 2. Speed reward (encourage moving at target speed, penalize excess)
-        if speed < TARGET_SPEED:
-            speed_reward = 0.2 * (speed / TARGET_SPEED)
-        else:
-            # Penalize speeding proportionally
-            speed_reward = 0.2 * max(0.0, 1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
+        # 2. Soft multiplicative penalties (CaRL-style: scale reward down,
+        # don't add competing negative terms).
+        # Speeding penalty: reduce reward when going too fast.
+        if speed > TARGET_SPEED:
+            overspeed_factor = max(0.5, 1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
+            reward *= overspeed_factor
 
-        # 3. Lane centering penalty
-        lane_penalty = 0.0
-        wp = self.map.get_waypoint(self.vehicle.get_location(), project_to_road=True,
-                                    lane_type=carla.LaneType.Driving)
-        if wp:
-            ego_loc = self.vehicle.get_location()
-            wp_loc = wp.transform.location
-            lane_offset = math.sqrt((ego_loc.x - wp_loc.x)**2 + (ego_loc.y - wp_loc.y)**2)
-            lane_penalty = -0.2 * min(lane_offset, 3.0)  # cap at 3m
-
-        # 4. Heading alignment (angle between vehicle heading and road direction)
-        heading_reward = 0.0
-        if wp:
-            vehicle_yaw = self.vehicle.get_transform().rotation.yaw
-            wp_yaw = wp.transform.rotation.yaw
-            angle_diff = abs(vehicle_yaw - wp_yaw) % 360
-            if angle_diff > 180:
-                angle_diff = 360 - angle_diff
-            # Reward for being well-aligned (max 0.02 when perfectly aligned).
-            # Kept small so "sit still and face the road" isn't a viable strategy.
-            heading_reward = 0.02 * (1.0 - angle_diff / 180.0)
-
-        # 5. Action smoothness penalty (CAPS-style)
-        steer = action[0]
-        throttle_brake = action[1]
-        steer_delta = abs(steer - self.prev_action[0])
-        throttle_delta = abs(throttle_brake - self.prev_action[1])
-        smoothness_penalty = -0.05 * (steer_delta + 0.3 * throttle_delta)
-
-        # 6. Stagnation tracking
-        # 0.5 m/s threshold: prevents the agent from gaming stagnation by
-        # creeping at 0.1 m/s.  Legitimate stops at red/yellow lights are
-        # exempted so the agent can learn to obey traffic signals.
+        # 3. Blocked detection — if the agent makes no progress for too
+        # long, terminate the episode.  CaRL uses 90s; we use 60s (1200
+        # steps at 20Hz) since our routes are shorter.
+        # No per-step penalty — the episode just ends, and the lost future
+        # route completion is the punishment.
         at_red_light = False
         if self.vehicle and self.vehicle.is_at_traffic_light():
             tl = self.vehicle.get_traffic_light()
@@ -368,35 +428,35 @@ class CarlaEnv(gym.Env):
                                          carla.TrafficLightState.Yellow):
                 at_red_light = True
 
-        if speed < 0.5 and not at_red_light:
+        no_progress = progress_delta < 0.01
+        if (speed < 0.5 or no_progress) and not at_red_light:
             self.stagnation_counter += 1
         else:
-            # Gradual decay instead of instant reset — brief movement
-            # shouldn't erase a long stagnation history.
             self.stagnation_counter = max(0, self.stagnation_counter - 2)
 
-        stagnation_penalty = 0.0
-        if self.stagnation_counter > 40:  # 2 seconds of being stuck
-            # Progressive: grows with duration, caps at 3× base penalty
-            stagnation_penalty = -0.3 * min(self.stagnation_counter / 40.0, 3.0)
-
-        # Combine reward
-        reward = progress_reward + speed_reward + lane_penalty + heading_reward + smoothness_penalty + stagnation_penalty
-
-        # 7. Collision — terminal with penalty
+        # 4. Collision — small explicit penalty + episode termination.
+        # The real cost is losing all future route progress reward.
+        # At 0.42/step with 1000+ steps remaining, the opportunity cost
+        # of crashing at step 100 is ~400+.  The -5 is just a hint.
         terminated = False
         if len(self.collision_history) > 0:
-            reward = -10.0
+            reward = -5.0
             terminated = True
 
-        # 8. Off-route penalty (too far from any route waypoint)
+        # 5. Off-route — terminate if too far from planned route.
+        # Check a lookahead window of 20 waypoints, not just the current
+        # one.  On sharp turns route_index can lag behind, making the
+        # single-waypoint distance artificially large.
         if self.route and self.route_index < len(self.route):
-            dist_to_route = self.vehicle.get_location().distance(
-                self.route[min(self.route_index, len(self.route) - 1)].transform.location
+            ego_loc = self.vehicle.get_location()
+            end_idx = min(self.route_index + 20, len(self.route))
+            dist_to_route = min(
+                ego_loc.distance(self.route[i].transform.location)
+                for i in range(self.route_index, end_idx)
             )
-            if dist_to_route > 30.0:
+            if dist_to_route > 15.0:
                 reward = -5.0
-                terminated = True  # Too far off route, end episode
+                terminated = True
 
         return reward, terminated
 
@@ -453,7 +513,7 @@ class CarlaEnv(gym.Env):
             dx = ego_loc.x - wp_loc.x
             dy = ego_loc.y - wp_loc.y
             # Cross product of lane-forward × ego-offset = signed lateral distance
-            signed_offset = dx * wp_fwd_y - dy * wp_fwd_x
+            signed_offset = wp_fwd_x * dy - wp_fwd_y * dx
             lane_offset = max(-1.0, min(1.0, signed_offset / 5.0))  # normalize to [-1, 1]
 
         # Traffic light state (one-hot: none=0, green=1, yellow=2, red=3)
@@ -560,16 +620,22 @@ class CarlaEnv(gym.Env):
                 if loc is None:
                     continue
                 spawn_point.location = loc
+                walker = None
                 try:
                     walker = self.world.spawn_actor(bp, spawn_point)
                     self.pedestrian_actors.append(walker)
+                except RuntimeError:
+                    continue
+                try:
                     controller = self.world.spawn_actor(walker_controller_bp, carla.Transform(), walker)
                     self.pedestrian_actors.append(controller)
                     controller.start()
                     controller.go_to_location(self.world.get_random_location_from_navigation())
                     controller.set_max_speed(1.0 + random.random() * 1.5)
                 except RuntimeError:
-                    continue
+                    # Walker spawned but controller failed — walker is already
+                    # tracked in self.pedestrian_actors so it will be cleaned up.
+                    pass
 
         except Exception as e:
             print(f"Warning: traffic spawning failed: {e}")
@@ -580,18 +646,36 @@ class CarlaEnv(gym.Env):
         Controllers must be stopped and destroyed before their parent walkers,
         so we split the pedestrian list into controllers vs walkers and handle
         them in the correct order.
+
+        After destroying our tracked actors, we also scan the world for any
+        orphaned NPCs (e.g. from a partially-failed spawn) and destroy those
+        too — this is the safety net against ghost cars.
         """
+        # Disable autopilot on traffic vehicles before destroying, so the
+        # TrafficManager releases them cleanly.
+        for actor in self.traffic_actors:
+            try:
+                actor.set_autopilot(False)
+            except Exception:
+                pass
+
         controllers = []
         walkers = []
         for actor in self.pedestrian_actors:
             try:
-                if actor.type_id == "controller.ai.walker":
+                type_id = actor.type_id
+            except Exception:
+                # Stale handle — skip; the safety-net sweep below will catch it
+                continue
+            try:
+                if type_id == "controller.ai.walker":
                     actor.stop()
                     controllers.append(actor)
                 else:
                     walkers.append(actor)
             except Exception:
-                pass
+                # stop() failed but we still need to destroy it
+                controllers.append(actor) if "controller" in str(type_id) else walkers.append(actor)
 
         # Destroy controllers first (children before parents)
         if controllers:
@@ -604,6 +688,34 @@ class CarlaEnv(gym.Env):
 
         self.traffic_actors = []
         self.pedestrian_actors = []
+
+        # Safety-net: destroy any NPC actors still in the world that we don't
+        # own (e.g. from a crashed previous episode within the same process,
+        # or actors spawned but never tracked due to an exception).
+        ego_id = self.vehicle.id if self.vehicle is not None else None
+        cam_id = self.camera.id if self.camera is not None else None
+        col_id = self.collision_sensor.id if self.collision_sensor is not None else None
+        owned_ids = {x for x in (ego_id, cam_id, col_id) if x is not None}
+
+        orphans = []
+        for pattern in ("vehicle.*", "walker.*", "controller.*"):
+            for actor in self.world.get_actors().filter(pattern):
+                if actor.id not in owned_ids:
+                    if "controller" in actor.type_id:
+                        try:
+                            actor.stop()
+                        except Exception:
+                            pass
+                    orphans.append(actor)
+        if orphans:
+            # Silently try to destroy — these are often already gone from
+            # the normal cleanup above (stale handles).  Only warn if the
+            # batch itself throws, not for individual "not found" errors.
+            batch = [carla.command.DestroyActor(a) for a in orphans]
+            try:
+                self.client.apply_batch_sync(batch)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # HELPERS
@@ -689,20 +801,21 @@ class CarlaEnv(gym.Env):
         self.collision_sensor = None
 
     def _batch_destroy(self, actors, label=""):
-        """Batch-destroy a list of actors and tick so the server processes it.
+        """Batch-destroy a list of actors.
 
-        Falls back to individual destroy() calls if the batch command fails.
+        apply_batch_sync already performs an implicit tick, so we do NOT tick
+        again afterward — the extra tick was advancing the simulation and
+        letting partially-destroyed actors interact for one more frame.
+
+        Falls back to individual destroy() calls + explicit tick if the batch
+        command fails.
         """
         if not actors:
             return
 
         batch = [carla.command.DestroyActor(a) for a in actors]
         try:
-            responses = self.client.apply_batch_sync(batch)
-            for i, resp in enumerate(responses):
-                if resp.error:
-                    print(f"[cleanup:{label}] failed to destroy "
-                          f"{actors[i].type_id} id={actors[i].id}: {resp.error}")
+            self.client.apply_batch_sync(batch)
         except Exception as e:
             print(f"[cleanup:{label}] batch destroy failed, falling back: {e}")
             for actor in actors:
@@ -710,12 +823,13 @@ class CarlaEnv(gym.Env):
                     actor.destroy()
                 except Exception:
                     pass
-
-        # Tick so the synchronous-mode server actually removes the actors.
-        try:
-            self.world.tick()
-        except Exception:
-            pass
+            # Only tick explicitly when using the individual-destroy fallback,
+            # because individual destroy() in sync mode queues commands that
+            # require a tick to take effect.
+            try:
+                self.world.tick()
+            except Exception:
+                pass
 
     def close(self):
         settings = self.world.get_settings()
