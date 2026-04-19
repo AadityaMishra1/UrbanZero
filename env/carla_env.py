@@ -230,14 +230,13 @@ class CarlaEnv(gym.Env):
         # Collision sensor
         col_bp = self.blueprint_library.find("sensor.other.collision")
         self.collision_sensor = self.world.spawn_actor(col_bp, carla.Transform(), attach_to=self.vehicle)
-        # Only count collisions with significant force — ignore curb scrapes,
-        # light pole brushes, etc.  CARLA collision events have a normal_impulse
-        # vector; its magnitude indicates force.  Threshold 500 filters out
-        # minor contacts that shouldn't end an episode.
+        # Only count collisions with significant force. Threshold 2000
+        # filters curb scrapes, pole brushes, and minor NPC contacts
+        # that were killing good driving episodes prematurely.
         def _on_collision(event):
             impulse = event.normal_impulse
             force = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
-            if force > 500.0:
+            if force > 2000.0:
                 self.collision_history.append(event)
         self.collision_sensor.listen(_on_collision)
 
@@ -295,8 +294,8 @@ class CarlaEnv(gym.Env):
                 reason = "COLLISION"
             elif self.stagnation_counter > 200:
                 reason = f"STAGNATION (counter={self.stagnation_counter})"
-            elif (len(self._progress_window) >= 100
-                  and sum(self._progress_window) < 3.0):
+            elif (len(self._progress_window) >= 60
+                  and sum(self._progress_window) < 5.0):
                 reason = "CIRCLING"
             elif self.step_count >= self.max_episode_steps:
                 reason = "MAX_STEPS"
@@ -506,9 +505,10 @@ class CarlaEnv(gym.Env):
             self.stagnation_counter = max(0, self.stagnation_counter - 1)
 
         # (b) Rolling progress window — catches circling at speed.
-        # If < 3m progress in last 100 steps (5 sec), terminate.
+        # 60 steps (3 sec) window, 5m threshold. Tighter than before
+        # so circlers die fast instead of outlasting good runs.
         self._progress_window.append(progress_delta)
-        if len(self._progress_window) > 100:
+        if len(self._progress_window) > 60:
             self._progress_window.pop(0)
 
         # 4. Collision — small explicit penalty + episode termination.
@@ -536,9 +536,10 @@ class CarlaEnv(gym.Env):
                 terminated = True
 
         # 6. Rolling progress check — catches circling at speed.
-        # After 100 steps (5 sec warmup), if < 3m progress, terminate.
-        if (len(self._progress_window) >= 100
-                and sum(self._progress_window) < 3.0
+        # 60 steps (3 sec), need 5m progress. Circling at 8m/s covers
+        # ~24m distance but <5m route progress = obvious circling.
+        if (len(self._progress_window) >= 60
+                and sum(self._progress_window) < 5.0
                 and not at_red_light):
             terminated = True
             reward = -5.0

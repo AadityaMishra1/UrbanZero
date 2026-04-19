@@ -13,21 +13,19 @@ if [ -n "$CKPT" ] && [ -f "$CKPT" ]; then
     echo "Resuming from: $CKPT"
 fi
 
-# Kill old session
+# Kill old training session (NOT spectator — that's separate)
 tmux kill-session -t urbanzero 2>/dev/null
 sleep 1
 
-# Create session with training in left pane
+# Training session
 tmux new-session -d -s urbanzero -x 200 -y 50
 tmux send-keys -t urbanzero:0.0 "$ACTIVATE && python3 -u agents/train.py $RESUME 2>&1 | tee ~/urbanzero/logs/train_\$(date +%Y%m%d_%H%M%S).log" Enter
 
-# Wait for training to connect to CARLA before starting spectator
-sleep 5
+# Spectator runs in its own session — start only if not already running
+if ! tmux has-session -t spectator 2>/dev/null; then
+    sleep 5
+    tmux new-session -d -s spectator -x 80 -y 20
+    tmux send-keys -t spectator "$ACTIVATE && python3 scripts/spectator.py" Enter
+fi
 
-# Spectator in right pane
-tmux split-window -t urbanzero:0.0 -h
-tmux send-keys -t urbanzero:0.1 "$ACTIVATE && python3 scripts/spectator.py" Enter
-
-echo "Training + spectator running in tmux session 'urbanzero'"
-echo "  Left pane:  training"
-echo "  Right pane: spectator"
+echo "Training in tmux 'urbanzero', spectator in tmux 'spectator'"
