@@ -196,7 +196,7 @@ def main():
             learning_rate=5e-5,
             n_epochs=2,
             ent_coef=0.01,
-            clip_range=0.15,
+            clip_range=0.2,
             max_grad_norm=0.5,
         )
     else:
@@ -214,7 +214,7 @@ def main():
             n_epochs=2,                # reduced from 3: fewer reuses of same data
             gamma=0.99,                 # discount factor
             gae_lambda=0.95,            # GAE lambda
-            clip_range=0.15,            # tighter clip to limit policy step size
+            clip_range=0.2,             # standard PPO clip range
             policy_kwargs=policy_kwargs,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
