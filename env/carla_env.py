@@ -296,12 +296,19 @@ class CarlaEnv(gym.Env):
         """Generate a route from start to a distant destination using GlobalRoutePlanner."""
         start_loc = start_sp.location
 
-        # Pick a destination that's far enough away (>100m)
+        # Pick a distant destination for a long route
         candidates = []
         for sp in spawn_points:
             d = start_loc.distance(sp.location)
-            if 100.0 < d < 500.0:
+            if 200.0 < d < 800.0:
                 candidates.append(sp)
+        # If not enough far destinations, relax to 100m+
+        if len(candidates) < 3:
+            candidates = []
+            for sp in spawn_points:
+                d = start_loc.distance(sp.location)
+                if 100.0 < d < 800.0:
+                    candidates.append(sp)
 
         if not candidates:
             # Fallback: pick the farthest spawn point
