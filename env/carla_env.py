@@ -294,7 +294,8 @@ class CarlaEnv(gym.Env):
                 reason = "COLLISION"
             elif self.stagnation_counter > 200:
                 reason = f"STAGNATION (counter={self.stagnation_counter})"
-            elif (len(self._progress_window) >= 60
+            elif (self.step_count > 80
+                  and len(self._progress_window) >= 80
                   and sum(self._progress_window) < 5.0):
                 reason = "CIRCLING"
             elif self.step_count >= self.max_episode_steps:
@@ -505,10 +506,10 @@ class CarlaEnv(gym.Env):
             self.stagnation_counter = max(0, self.stagnation_counter - 1)
 
         # (b) Rolling progress window — catches circling at speed.
-        # 60 steps (3 sec) window, 5m threshold. Tighter than before
-        # so circlers die fast instead of outlasting good runs.
+        # 80-step window (4 sec), 5m threshold. Only starts checking
+        # after step 80 so the car has time to accelerate and orient.
         self._progress_window.append(progress_delta)
-        if len(self._progress_window) > 60:
+        if len(self._progress_window) > 80:
             self._progress_window.pop(0)
 
         # 4. Collision — small explicit penalty + episode termination.
@@ -536,9 +537,11 @@ class CarlaEnv(gym.Env):
                 terminated = True
 
         # 6. Rolling progress check — catches circling at speed.
-        # 60 steps (3 sec), need 5m progress. Circling at 8m/s covers
-        # ~24m distance but <5m route progress = obvious circling.
-        if (len(self._progress_window) >= 60
+        # Starts after step 80 (4 sec warmup for acceleration/orienting).
+        # 80-step window, 5m threshold. Circling at 8m/s covers ~32m
+        # but <5m route progress = obvious circling.
+        if (self.step_count > 80
+                and len(self._progress_window) >= 80
                 and sum(self._progress_window) < 5.0
                 and not at_red_light):
             terminated = True
