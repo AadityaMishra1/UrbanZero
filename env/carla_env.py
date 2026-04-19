@@ -272,10 +272,11 @@ class CarlaEnv(gym.Env):
         self.prev_action = np.array([steer, throttle_brake], dtype=np.float32)
 
         truncated = self.step_count >= self.max_episode_steps
-        # Blocked detector: 5 seconds (100 steps) of no meaningful
-        # progress.  Red lights rarely last >5s in CARLA, and the
-        # at_red_light exemption handles legitimate stops.
-        if self.stagnation_counter > 100:
+        # Blocked detector: 10 seconds (200 steps) of no meaningful
+        # progress. Red light exemption handles legitimate stops.
+        # Now that progress tracking uses projection (not 3D distance),
+        # this accurately reflects real forward movement.
+        if self.stagnation_counter > 200:
             truncated = True
 
         info = {
@@ -333,53 +334,65 @@ class CarlaEnv(gym.Env):
             return 0.0
 
         ego_loc = self.vehicle.get_location()
-        progress_delta = 0.0
-        old_seg_idx = self._prev_seg_idx
-        old_seg_t = self._prev_seg_t
 
-        # Advance past any fully-crossed waypoints
-        first_crossing = True
+        # Use ONLY 2D along-track projection for everything.
+        # The old code used 3D Euclidean distance for crossing detection
+        # but 2D projection for progress — lateral offset inflated the
+        # 3D distance, causing premature segment advancement and then
+        # multiple steps of zero progress_delta (t clamped to 0).
+
+        def _project_t(seg_start, seg_end):
+            """Project ego onto segment, return t in [0, 1] and segment length."""
+            sx = seg_end.x - seg_start.x
+            sy = seg_end.y - seg_start.y
+            seg_len_sq = sx * sx + sy * sy
+            if seg_len_sq < 0.01:
+                return 0.0, 0.0
+            t = ((ego_loc.x - seg_start.x) * sx + (ego_loc.y - seg_start.y) * sy) / seg_len_sq
+            return t, math.sqrt(seg_len_sq)
+
+        # Advance past segments where projection t >= 1.0 (fully crossed)
         while self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
             next_wp_loc = self.route[self.route_index + 1].transform.location
-            dist_to_next = ego_loc.distance(next_wp_loc)
-            dist_between = wp_loc.distance(next_wp_loc)
-
-            if ego_loc.distance(wp_loc) > dist_between * 0.5 and dist_to_next < dist_between * 1.5:
-                if first_crossing and self.route_index == old_seg_idx:
-                    # First segment crossed: only credit the remaining
-                    # portion (1 - old_t) since [0, old_t] was already
-                    # rewarded in previous steps.
-                    progress_delta += dist_between * (1.0 - old_seg_t)
-                    first_crossing = False
-                else:
-                    progress_delta += dist_between
+            t, seg_len = _project_t(wp_loc, next_wp_loc)
+            if t >= 1.0:
                 self.route_index += 1
             else:
                 break
 
-        # Continuous progress within the current segment
+        # Compute progress_delta from the projection on current segment
+        progress_delta = 0.0
         if self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
             next_wp_loc = self.route[self.route_index + 1].transform.location
-            sx = next_wp_loc.x - wp_loc.x
-            sy = next_wp_loc.y - wp_loc.y
-            seg_len_sq = sx * sx + sy * sy
-            if seg_len_sq > 0.01:
-                t = ((ego_loc.x - wp_loc.x) * sx + (ego_loc.y - wp_loc.y) * sy) / seg_len_sq
-                t = max(0.0, min(1.0, t))
-                seg_len = math.sqrt(seg_len_sq)
-                if self._prev_seg_idx == self.route_index:
-                    # Same segment as last step — incremental progress
-                    dt = t - self._prev_seg_t
-                    if dt > 0:
-                        progress_delta += dt * seg_len
-                else:
-                    # Crossed into new segment — credit from start of
-                    # this segment only
-                    progress_delta += t * seg_len
-                self._prev_seg_t = t
-                self._prev_seg_idx = self.route_index
+            t, seg_len = _project_t(wp_loc, next_wp_loc)
+            t = max(0.0, min(1.0, t))
+
+            if self._prev_seg_idx == self.route_index:
+                # Same segment — incremental progress
+                dt = t - self._prev_seg_t
+                if dt > 0:
+                    progress_delta = dt * seg_len
+            elif self.route_index > self._prev_seg_idx:
+                # Crossed segment(s) — credit remaining old segment + new segment progress
+                # Remaining portion of old segment
+                if self._prev_seg_idx < len(self.route) - 1:
+                    old_wp = self.route[self._prev_seg_idx].transform.location
+                    old_next = self.route[self._prev_seg_idx + 1].transform.location
+                    _, old_seg_len = _project_t(old_wp, old_next)
+                    progress_delta += (1.0 - self._prev_seg_t) * old_seg_len
+                # Full segments in between
+                for idx in range(self._prev_seg_idx + 1, self.route_index):
+                    if idx < len(self.route) - 1:
+                        s = self.route[idx].transform.location
+                        e = self.route[idx + 1].transform.location
+                        progress_delta += s.distance(e)
+                # Current segment progress
+                progress_delta += t * seg_len
+
+            self._prev_seg_t = t
+            self._prev_seg_idx = self.route_index
 
         return progress_delta
 
@@ -448,7 +461,7 @@ class CarlaEnv(gym.Env):
                                          carla.TrafficLightState.Yellow):
                 at_red_light = True
 
-        no_progress = progress_delta < 0.05  # need real forward movement, not noise
+        no_progress = progress_delta < 0.01  # with projection-based tracking, this is accurate
         if (speed < 0.5 or no_progress) and not at_red_light:
             self.stagnation_counter += 1
         else:
