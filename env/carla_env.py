@@ -449,17 +449,20 @@ class CarlaEnv(gym.Env):
             terminated = True
 
         # 5. Off-route — terminate if too far from planned route.
-        # Check a lookahead window of 20 waypoints, not just the current
-        # one.  On sharp turns route_index can lag behind, making the
-        # single-waypoint distance artificially large.
+        # Check a wide lookahead window (50 waypoints ~100m) so that
+        # route_index lag on curves doesn't cause false termination.
+        # Threshold 30m: at 6 m/s the agent has 5 seconds to correct,
+        # which is enough to recover from an overshoot.
         if self.route and self.route_index < len(self.route):
             ego_loc = self.vehicle.get_location()
-            end_idx = min(self.route_index + 20, len(self.route))
+            end_idx = min(self.route_index + 50, len(self.route))
+            # Also check a few waypoints behind in case route_index advanced past ego
+            start_idx = max(0, self.route_index - 5)
             dist_to_route = min(
                 ego_loc.distance(self.route[i].transform.location)
-                for i in range(self.route_index, end_idx)
+                for i in range(start_idx, end_idx)
             )
-            if dist_to_route > 15.0:
+            if dist_to_route > 30.0:
                 reward = -5.0
                 terminated = True
 
