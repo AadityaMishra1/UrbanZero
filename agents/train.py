@@ -174,10 +174,10 @@ def main():
 
     # PPO with custom CNN extractor
     policy_kwargs = dict(
-        log_std_init=0.0,
+        log_std_init=-1.0,
         features_extractor_class=DrivingCNN,
         features_extractor_kwargs=dict(features_dim=256),
-        net_arch=dict(pi=[256, 128], vf=[256, 128]),  # separate actor/critic heads
+        net_arch=dict(pi=[256, 128], vf=[256, 128]),
     )
 
     # Scale batch parameters with number of envs
@@ -195,7 +195,7 @@ def main():
             # checkpoint, ignoring the tuned values above.
             learning_rate=5e-5,
             n_epochs=2,
-            ent_coef=0.01,
+            ent_coef=0.001,
             clip_range=0.2,
             max_grad_norm=0.5,
         )
@@ -206,7 +206,7 @@ def main():
             verbose=1,
             tensorboard_log=LOG_DIR,
             learning_rate=5e-5,             # reduced from 1e-4: stabilize KL/clip
-            ent_coef=0.01,              # exploration (prevents std collapse)
+            ent_coef=0.001,             # minimal — clamp prevents collapse
             vf_coef=0.5,               # value function loss weight
             max_grad_norm=0.5,          # gradient clipping
             n_steps=n_steps,            # rollout length per env

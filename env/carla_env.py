@@ -136,6 +136,9 @@ class CarlaEnv(gym.Env):
         self.total_route_length = 0.0
         self.route_progress = 0.0  # cumulative meters traveled along route
         self.stagnation_counter = 0
+        # Rolling progress window: track progress over last 100 steps (5 sec)
+        # to detect circling at speed (stagnation counter misses this)
+        self._progress_window = []
 
     def reset(self, seed=None, options=None):
         self._destroy_actors()
@@ -147,6 +150,7 @@ class CarlaEnv(gym.Env):
         self.route_progress = 0.0
         self._prev_seg_t = 0.0
         self._prev_seg_idx = 0
+        self._progress_window = []
 
         # Weather randomization
         if self.enable_weather_randomization:
@@ -281,10 +285,6 @@ class CarlaEnv(gym.Env):
         self.prev_action = np.array([steer, throttle_brake], dtype=np.float32)
 
         truncated = self.step_count >= self.max_episode_steps
-        # Blocked detector: 10 seconds (200 steps) of no meaningful
-        # progress. Red light exemption handles legitimate stops.
-        # Now that progress tracking uses projection (not 3D distance),
-        # this accurately reflects real forward movement.
         if self.stagnation_counter > 200:
             truncated = True
 
@@ -295,10 +295,12 @@ class CarlaEnv(gym.Env):
                 reason = "COLLISION"
             elif self.stagnation_counter > 200:
                 reason = f"STAGNATION (counter={self.stagnation_counter})"
+            elif (len(self._progress_window) >= 100
+                  and sum(self._progress_window) < 3.0):
+                reason = "CIRCLING"
             elif self.step_count >= self.max_episode_steps:
                 reason = "MAX_STEPS"
             else:
-                # Must be off-route termination
                 reason = "OFF_ROUTE"
             speed = self._get_speed()
             rc = self._get_route_completion()
@@ -467,8 +469,8 @@ class CarlaEnv(gym.Env):
         else:
             speed_reward = 0.3 * max(0.0, 1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
 
-        # Only speed reward when facing roughly the right direction.
-        # No separate penalty terms — keep reward clean.
+        # Only speed reward when facing the right direction.
+        # Require alignment > 0.7 (~45°) — eliminates reward for circling.
         if self.route and self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
             next_wp = self.route[min(self.route_index + 1, len(self.route) - 1)].transform.location
@@ -477,21 +479,17 @@ class CarlaEnv(gym.Env):
             angle_diff = abs(vehicle_yaw - route_yaw) % 360
             if angle_diff > 180:
                 angle_diff = 360 - angle_diff
-            # Scale speed reward by alignment: full reward when aligned,
-            # zero when perpendicular, zero when backwards.
-            # cos(angle_diff) naturally gives 1.0 at 0°, 0.0 at 90°, -1.0 at 180°
             alignment = max(0.0, math.cos(math.radians(angle_diff)))
-            speed_reward *= alignment
+            if alignment < 0.7:
+                speed_reward = 0.0
+            else:
+                speed_reward *= alignment
 
         reward = progress_reward + speed_reward
 
-        # 3. Blocked/wrong-way detection — terminate episodes that are
-        # clearly not making progress. This is the PRIMARY mechanism to
-        # discourage U-turns, circling, and twitching: bad episodes end
-        # early, so the agent gets less total reward from them.
-        # Check for nearby traffic lights — CARLA's is_at_traffic_light()
-        # only triggers at the stop line. We also check if any traffic light
-        # within 25m is red/yellow, which covers normal stopping distances.
+        # 3. Blocked/wrong-way detection.
+        # Two mechanisms: (a) stagnation counter for stopped cars,
+        # (b) rolling progress window for circling at speed.
         at_red_light = False
         if self.vehicle:
             if self.vehicle.is_at_traffic_light():
@@ -499,26 +497,19 @@ class CarlaEnv(gym.Env):
                 if tl and tl.get_state() in (carla.TrafficLightState.Red,
                                              carla.TrafficLightState.Yellow):
                     at_red_light = True
-            if not at_red_light:
-                # Check nearby traffic lights by looking at the waypoint ahead
-                ego_loc = self.vehicle.get_location()
-                wp = self.map.get_waypoint(ego_loc, project_to_road=True,
-                                           lane_type=carla.LaneType.Driving)
-                if wp and wp.is_junction:
-                    # Near a junction — likely a traffic light area
-                    at_red_light = True
-                elif wp:
-                    # Check if there's a red/yellow light on our road ahead
-                    for lwp in wp.next(25.0):
-                        if lwp.is_junction:
-                            at_red_light = True
-                            break
 
+        # (a) Stagnation counter — catches stopped/crawling cars
         no_progress = progress_delta < 0.01
         if (speed < 0.5 or no_progress) and not at_red_light:
             self.stagnation_counter += 1
         else:
             self.stagnation_counter = max(0, self.stagnation_counter - 1)
+
+        # (b) Rolling progress window — catches circling at speed.
+        # If < 3m progress in last 100 steps (5 sec), terminate.
+        self._progress_window.append(progress_delta)
+        if len(self._progress_window) > 100:
+            self._progress_window.pop(0)
 
         # 4. Collision — small explicit penalty + episode termination.
         # The real cost is losing all future route progress reward.
@@ -530,22 +521,25 @@ class CarlaEnv(gym.Env):
             terminated = True
 
         # 5. Off-route — terminate if too far from planned route.
-        # Check a wide lookahead window (50 waypoints ~100m) so that
-        # route_index lag on curves doesn't cause false termination.
-        # Threshold 30m: at 6 m/s the agent has 5 seconds to correct,
-        # which is enough to recover from an overshoot.
         if self.route and self.route_index < len(self.route):
             ego_loc = self.vehicle.get_location()
             end_idx = min(self.route_index + 50, len(self.route))
-            # Also check a few waypoints behind in case route_index advanced past ego
             start_idx = max(0, self.route_index - 5)
             dist_to_route = min(
                 ego_loc.distance(self.route[i].transform.location)
                 for i in range(start_idx, end_idx)
             )
-            if dist_to_route > 30.0:
+            if dist_to_route > 15.0:
                 reward = -5.0
                 terminated = True
+
+        # 6. Rolling progress check — catches circling at speed.
+        # After 100 steps (5 sec warmup), if < 3m progress, terminate.
+        if (len(self._progress_window) >= 100
+                and sum(self._progress_window) < 3.0
+                and not at_red_light):
+            terminated = True
+            reward = -5.0
 
         return reward, terminated
 
