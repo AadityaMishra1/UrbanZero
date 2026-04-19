@@ -272,10 +272,10 @@ class CarlaEnv(gym.Env):
         self.prev_action = np.array([steer, throttle_brake], dtype=np.float32)
 
         truncated = self.step_count >= self.max_episode_steps
-        # Blocked detector: 15 seconds (300 steps) of no meaningful
-        # progress.  Long enough that red light stops (~10s) don't
-        # trigger it, short enough that "sit still" isn't viable.
-        if self.stagnation_counter > 300:
+        # Blocked detector: 5 seconds (100 steps) of no meaningful
+        # progress.  Red lights rarely last >5s in CARLA, and the
+        # at_red_light exemption handles legitimate stops.
+        if self.stagnation_counter > 100:
             truncated = True
 
         info = {
@@ -419,21 +419,8 @@ class CarlaEnv(gym.Env):
         else:
             speed_reward = 0.3 * max(0.0, 1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
 
-        # 2b. Steering smoothness — penalize rapid left-right oscillation.
-        # Without this the agent learns violent twitching because there's
-        # no cost to jerky steering as long as speed stays up.
-        steer = action[0]
-        steer_delta = abs(steer - self.prev_action[0])
-        smoothness_penalty = -0.15 * steer_delta
-
-        # 2c. Steering magnitude — penalize holding full lock.
-        # Prevents constant-turn circles and U-turns.
-        steering_mag_penalty = -0.05 * abs(steer)
-
-        # 2d. Wrong-way penalty — if heading is >90° off from route
-        # direction, the speed reward should not apply (the agent is
-        # driving fast in the wrong direction).
-        heading_factor = 1.0
+        # Only speed reward when facing roughly the right direction.
+        # No separate penalty terms — keep reward clean.
         if self.route and self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
             next_wp = self.route[min(self.route_index + 1, len(self.route) - 1)].transform.location
@@ -442,18 +429,18 @@ class CarlaEnv(gym.Env):
             angle_diff = abs(vehicle_yaw - route_yaw) % 360
             if angle_diff > 180:
                 angle_diff = 360 - angle_diff
-            if angle_diff > 90:
-                # Driving backwards — zero out speed reward, add penalty
-                heading_factor = 0.0
-                speed_reward = -0.2  # active penalty for wrong-way driving
+            # Scale speed reward by alignment: full reward when aligned,
+            # zero when perpendicular, zero when backwards.
+            # cos(angle_diff) naturally gives 1.0 at 0°, 0.0 at 90°, -1.0 at 180°
+            alignment = max(0.0, math.cos(math.radians(angle_diff)))
+            speed_reward *= alignment
 
-        reward = progress_reward + speed_reward * heading_factor + smoothness_penalty + steering_mag_penalty
+        reward = progress_reward + speed_reward
 
-        # 3. Blocked detection — if the agent makes no progress for too
-        # long, terminate the episode.  CaRL uses 90s; we use 60s (1200
-        # steps at 20Hz) since our routes are shorter.
-        # No per-step penalty — the episode just ends, and the lost future
-        # route completion is the punishment.
+        # 3. Blocked/wrong-way detection — terminate episodes that are
+        # clearly not making progress. This is the PRIMARY mechanism to
+        # discourage U-turns, circling, and twitching: bad episodes end
+        # early, so the agent gets less total reward from them.
         at_red_light = False
         if self.vehicle and self.vehicle.is_at_traffic_light():
             tl = self.vehicle.get_traffic_light()
@@ -461,11 +448,13 @@ class CarlaEnv(gym.Env):
                                          carla.TrafficLightState.Yellow):
                 at_red_light = True
 
-        no_progress = progress_delta < 0.01
+        no_progress = progress_delta < 0.05  # need real forward movement, not noise
         if (speed < 0.5 or no_progress) and not at_red_light:
             self.stagnation_counter += 1
         else:
-            self.stagnation_counter = max(0, self.stagnation_counter - 2)
+            # Slow decay: need sustained good driving to clear history.
+            # Prevents a single lucky step from erasing 4 seconds of garbage.
+            self.stagnation_counter = max(0, self.stagnation_counter - 1)
 
         # 4. Collision — small explicit penalty + episode termination.
         # The real cost is losing all future route progress reward.
