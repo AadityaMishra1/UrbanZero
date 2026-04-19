@@ -226,7 +226,16 @@ class CarlaEnv(gym.Env):
         # Collision sensor
         col_bp = self.blueprint_library.find("sensor.other.collision")
         self.collision_sensor = self.world.spawn_actor(col_bp, carla.Transform(), attach_to=self.vehicle)
-        self.collision_sensor.listen(lambda e: self.collision_history.append(e))
+        # Only count collisions with significant force — ignore curb scrapes,
+        # light pole brushes, etc.  CARLA collision events have a normal_impulse
+        # vector; its magnitude indicates force.  Threshold 500 filters out
+        # minor contacts that shouldn't end an episode.
+        def _on_collision(event):
+            impulse = event.normal_impulse
+            force = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
+            if force > 500.0:
+                self.collision_history.append(event)
+        self.collision_sensor.listen(_on_collision)
 
         # Wait for first image BEFORE spawning traffic — if traffic spawns
         # first, NPCs can collide with the ego vehicle during the image wait,
@@ -278,6 +287,25 @@ class CarlaEnv(gym.Env):
         # this accurately reflects real forward movement.
         if self.stagnation_counter > 200:
             truncated = True
+
+        # DEBUG: log WHY every episode ends
+        if terminated or truncated:
+            reason = "UNKNOWN"
+            if len(self.collision_history) > 0:
+                reason = "COLLISION"
+            elif self.stagnation_counter > 200:
+                reason = f"STAGNATION (counter={self.stagnation_counter})"
+            elif self.step_count >= self.max_episode_steps:
+                reason = "MAX_STEPS"
+            else:
+                # Must be off-route termination
+                reason = "OFF_ROUTE"
+            speed = self._get_speed()
+            rc = self._get_route_completion()
+            print(f"[EPISODE END] reason={reason} steps={self.step_count} "
+                  f"({self.step_count*0.05:.1f}s) speed={speed:.1f}m/s "
+                  f"route={rc*100:.1f}% stag={self.stagnation_counter} "
+                  f"progress={self.route_progress:.1f}m/{self.total_route_length:.0f}m")
 
         info = {
             "route_completion": self._get_route_completion(),
