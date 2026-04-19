@@ -489,19 +489,35 @@ class CarlaEnv(gym.Env):
         # clearly not making progress. This is the PRIMARY mechanism to
         # discourage U-turns, circling, and twitching: bad episodes end
         # early, so the agent gets less total reward from them.
+        # Check for nearby traffic lights — CARLA's is_at_traffic_light()
+        # only triggers at the stop line. We also check if any traffic light
+        # within 25m is red/yellow, which covers normal stopping distances.
         at_red_light = False
-        if self.vehicle and self.vehicle.is_at_traffic_light():
-            tl = self.vehicle.get_traffic_light()
-            if tl and tl.get_state() in (carla.TrafficLightState.Red,
-                                         carla.TrafficLightState.Yellow):
-                at_red_light = True
+        if self.vehicle:
+            if self.vehicle.is_at_traffic_light():
+                tl = self.vehicle.get_traffic_light()
+                if tl and tl.get_state() in (carla.TrafficLightState.Red,
+                                             carla.TrafficLightState.Yellow):
+                    at_red_light = True
+            if not at_red_light:
+                # Check nearby traffic lights by looking at the waypoint ahead
+                ego_loc = self.vehicle.get_location()
+                wp = self.map.get_waypoint(ego_loc, project_to_road=True,
+                                           lane_type=carla.LaneType.Driving)
+                if wp and wp.is_junction:
+                    # Near a junction — likely a traffic light area
+                    at_red_light = True
+                elif wp:
+                    # Check if there's a red/yellow light on our road ahead
+                    for lwp in wp.next(25.0):
+                        if lwp.is_junction:
+                            at_red_light = True
+                            break
 
-        no_progress = progress_delta < 0.01  # with projection-based tracking, this is accurate
+        no_progress = progress_delta < 0.01
         if (speed < 0.5 or no_progress) and not at_red_light:
             self.stagnation_counter += 1
         else:
-            # Slow decay: need sustained good driving to clear history.
-            # Prevents a single lucky step from erasing 4 seconds of garbage.
             self.stagnation_counter = max(0, self.stagnation_counter - 1)
 
         # 4. Collision — small explicit penalty + episode termination.
