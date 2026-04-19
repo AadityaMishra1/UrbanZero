@@ -193,10 +193,10 @@ def main():
             # Override checkpoint's saved hyperparameters with current values.
             # Without this, PPO.load() silently uses the old LR/epochs from the
             # checkpoint, ignoring the tuned values above.
-            learning_rate=1e-4,
-            n_epochs=3,
+            learning_rate=5e-5,
+            n_epochs=2,
             ent_coef=0.01,
-            clip_range=0.2,
+            clip_range=0.15,
             max_grad_norm=0.5,
         )
     else:
@@ -205,16 +205,16 @@ def main():
             env,
             verbose=1,
             tensorboard_log=LOG_DIR,
-            learning_rate=1e-4,             # reduced from 3e-4: stabilize KL/clip
+            learning_rate=5e-5,             # reduced from 1e-4: stabilize KL/clip
             ent_coef=0.01,              # exploration (prevents std collapse)
             vf_coef=0.5,               # value function loss weight
             max_grad_norm=0.5,          # gradient clipping
             n_steps=n_steps,            # rollout length per env
             batch_size=batch_size,      # mini-batch size
-            n_epochs=3,                # reduced from 5: fewer reuses of same data
+            n_epochs=2,                # reduced from 3: fewer reuses of same data
             gamma=0.99,                 # discount factor
             gae_lambda=0.95,            # GAE lambda
-            clip_range=0.2,             # PPO clipping range
+            clip_range=0.15,            # tighter clip to limit policy step size
             policy_kwargs=policy_kwargs,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
