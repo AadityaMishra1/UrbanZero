@@ -419,7 +419,35 @@ class CarlaEnv(gym.Env):
         else:
             speed_reward = 0.3 * max(0.0, 1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
 
-        reward = progress_reward + speed_reward
+        # 2b. Steering smoothness — penalize rapid left-right oscillation.
+        # Without this the agent learns violent twitching because there's
+        # no cost to jerky steering as long as speed stays up.
+        steer = action[0]
+        steer_delta = abs(steer - self.prev_action[0])
+        smoothness_penalty = -0.15 * steer_delta
+
+        # 2c. Steering magnitude — penalize holding full lock.
+        # Prevents constant-turn circles and U-turns.
+        steering_mag_penalty = -0.05 * abs(steer)
+
+        # 2d. Wrong-way penalty — if heading is >90° off from route
+        # direction, the speed reward should not apply (the agent is
+        # driving fast in the wrong direction).
+        heading_factor = 1.0
+        if self.route and self.route_index < len(self.route) - 1:
+            wp_loc = self.route[self.route_index].transform.location
+            next_wp = self.route[min(self.route_index + 1, len(self.route) - 1)].transform.location
+            route_yaw = math.degrees(math.atan2(next_wp.y - wp_loc.y, next_wp.x - wp_loc.x))
+            vehicle_yaw = self.vehicle.get_transform().rotation.yaw
+            angle_diff = abs(vehicle_yaw - route_yaw) % 360
+            if angle_diff > 180:
+                angle_diff = 360 - angle_diff
+            if angle_diff > 90:
+                # Driving backwards — zero out speed reward, add penalty
+                heading_factor = 0.0
+                speed_reward = -0.2  # active penalty for wrong-way driving
+
+        reward = progress_reward + speed_reward * heading_factor + smoothness_penalty + steering_mag_penalty
 
         # 3. Blocked detection — if the agent makes no progress for too
         # long, terminate the episode.  CaRL uses 90s; we use 60s (1200
