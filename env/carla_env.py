@@ -402,19 +402,24 @@ class CarlaEnv(gym.Env):
     def _compute_reward(self, action):
         speed = self._get_speed()
 
-        # 1. Route progress — the ONLY positive reward signal.
-        # Every meter of progress along the planned route = +1.0 reward.
-        # At target speed (8.3 m/s) this gives ~0.42/step.
+        # 1. Route progress — primary reward signal.
+        # Every meter of progress along the planned route = +2.0 reward.
+        # Scaled up from 1.0 so the signal is strong enough for single-env training.
         progress_delta = self._advance_route_index()
         self.route_progress += progress_delta
-        reward = progress_delta * 1.0
+        progress_reward = progress_delta * 2.0
 
-        # 2. Soft multiplicative penalties (CaRL-style: scale reward down,
-        # don't add competing negative terms).
-        # Speeding penalty: reduce reward when going too fast.
-        if speed > TARGET_SPEED:
-            overspeed_factor = max(0.5, 1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
-            reward *= overspeed_factor
+        # 2. Speed reward — necessary bootstrap for single-env training.
+        # Pure progress-only (CaRL) needs massive parallelism to work.
+        # With 1 env, the agent crawls at 0.7 m/s and gets near-zero
+        # progress reward per step, so the value function can't learn.
+        # This gives a clear signal: going faster toward target = good.
+        if speed < TARGET_SPEED:
+            speed_reward = 0.3 * (speed / TARGET_SPEED)
+        else:
+            speed_reward = 0.3 * max(0.0, 1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
+
+        reward = progress_reward + speed_reward
 
         # 3. Blocked detection — if the agent makes no progress for too
         # long, terminate the episode.  CaRL uses 90s; we use 60s (1200
