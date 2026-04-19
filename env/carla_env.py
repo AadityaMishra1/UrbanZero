@@ -521,7 +521,9 @@ class CarlaEnv(gym.Env):
             terminated = True
 
         # 5. Off-route — terminate if too far from planned route.
-        if self.route and self.route_index < len(self.route):
+        # Skip first 20 steps: spawn→route alignment isn't always perfect.
+        if (self.step_count > 20 and self.route
+                and self.route_index < len(self.route)):
             ego_loc = self.vehicle.get_location()
             end_idx = min(self.route_index + 50, len(self.route))
             start_idx = max(0, self.route_index - 5)
