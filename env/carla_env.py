@@ -403,7 +403,7 @@ class CarlaEnv(gym.Env):
             steps_since_prog = self.step_count - self._last_significant_progress_step
             if len(self.collision_history) > 0:
                 reason = "COLLISION"
-            elif self.stagnation_counter > 200:
+            elif self.stagnation_counter > 150:
                 reason = f"STAGNATION (counter={self.stagnation_counter})"
             elif rc > 0.85 or self.route_index >= len(self.route) - 2:
                 reason = "ROUTE_COMPLETE"
@@ -608,7 +608,13 @@ class CarlaEnv(gym.Env):
 
         # 2. Speed reward, signed by route alignment.
         # Triangle-shaped peak at TARGET_SPEED, falls to 0 at MAX_SPEED.
-        if speed < TARGET_SPEED:
+        # Floor penalty: standing still or barely moving costs -0.2/step.
+        # This makes every slow step expensive (150 steps × -0.2 = -30 cumulative)
+        # and eliminates the counter-gaming exploit where the agent twitches
+        # just enough to decrement the stagnation counter while going nowhere.
+        if speed < 1.0:
+            speed_reward = -0.2
+        elif speed < TARGET_SPEED:
             speed_reward = 0.3 * (speed / TARGET_SPEED)
         elif speed < MAX_SPEED:
             speed_reward = 0.3 * (1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
