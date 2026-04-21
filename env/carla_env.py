@@ -661,38 +661,24 @@ class CarlaEnv(gym.Env):
         # facing wrong way). Also too weak: 151 steps × -0.2 = -30, easily
         # offset by ~50 steps of driving reward.
         #
-        # New: -1.0/step when truly stopped (<0.5 m/s), -0.3 when crawling.
-        # 151 steps × -1.0 = -151 + -5.0 terminal = -156. No driving
-        # strategy can accumulate enough to make stop-then-die profitable.
-        if speed < 0.5:
-            idle_penalty = -1.0
-        elif speed < 1.0:
-            idle_penalty = -0.3
-        else:
-            idle_penalty = 0.0
+        # Gating: the penalty MUST skip red lights and legit queues, or the
+        # agent gets crushed for obeying the law (a 20s red light at
+        # -1.0/step = -400 reward, teaching the agent to run red lights or
+        # stop far back to avoid the intersection entirely).
+        #
+        # Computing the gates here requires the at_red_light / blocked_ahead
+        # / route_alignment values, so those are computed up-front now
+        # (moved up from the stagnation-counter section below).
 
-        reward = progress_reward + speed_reward + lateral_penalty + smoothness_penalty + idle_penalty
-
-        # 3. Blocked/wrong-way detection.
-        # Two mechanisms: (a) stagnation counter for stopped cars,
-        # (b) rolling progress window for circling at speed.
+        # Pre-compute gating signals (shared with stagnation counter).
         at_red_light = False
-        if self.vehicle:
+        if self.vehicle is not None:
             if self.vehicle.is_at_traffic_light():
                 tl = self.vehicle.get_traffic_light()
                 if tl and tl.get_state() in (carla.TrafficLightState.Red,
                                              carla.TrafficLightState.Yellow):
                     at_red_light = True
-
-        # Is the car blocked by a vehicle in its lane?
         blocked_ahead = self._is_blocked_by_vehicle()
-
-        # Route alignment: 1.0 = facing along route, 0 = perpendicular,
-        # <0 = backwards. Used to disambiguate "queued behind a slow bus"
-        # (aligned + blocked = legit) from "circling in figure-8 in dense
-        # traffic" (not aligned + blocked = NOT a legit excuse to skip
-        # termination). Without this gate, any circling agent that bumps
-        # into traffic avoids both stagnation AND circling kills.
         route_alignment = 1.0
         if self.route and self.route_index < len(self.route) - 1:
             wp_a = self.route[self.route_index].transform.location
@@ -704,10 +690,28 @@ class CarlaEnv(gym.Env):
                 d = 360 - d
             route_alignment = math.cos(math.radians(d))
         legit_queue = blocked_ahead and route_alignment > 0.5
+        legit_stop = at_red_light or legit_queue  # OK to be stationary here
 
-        # (a) Stagnation counter — catches stopped/crawling cars.
+        # Smooth idle penalty — continuous ramp, no cliff at speed=1.0.
+        # Before: step function 0 -> -0.3 -> -1.0 with a discontinuity
+        # at speed=1.0 that created a hovering attractor (agent learned
+        # to crawl at exactly 1.01 m/s to avoid the penalty cliff).
+        # Now: linear ramp from -1.0 at stopped to 0 at 1.5 m/s.
+        if legit_stop:
+            idle_penalty = 0.0  # obeying red light / queued behind bus
+        elif speed >= 1.5:
+            idle_penalty = 0.0
+        else:
+            idle_penalty = -1.0 * (1.5 - speed) / 1.5  # [-1.0 .. 0] linear
+
+        reward = progress_reward + speed_reward + lateral_penalty + smoothness_penalty + idle_penalty
+
+        # Stagnation counter — catches stopped/crawling cars.
+        # Gates (at_red_light, legit_queue) were computed above for idle_penalty;
+        # reused here so stagnation and idle penalty agree on what "legitimate
+        # stopping" means.
         no_progress = progress_delta < 0.01
-        if (speed < 0.5 or no_progress) and not at_red_light and not legit_queue:
+        if (speed < 0.5 or no_progress) and not legit_stop:
             self.stagnation_counter += 1
         else:
             self.stagnation_counter = max(0, self.stagnation_counter - 1)
