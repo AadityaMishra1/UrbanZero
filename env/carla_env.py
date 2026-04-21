@@ -141,6 +141,23 @@ class CarlaEnv(gym.Env):
         self._progress_window = []
 
     def reset(self, seed=None, options=None):
+        # Retry up to 3 times: black-image timeouts, no-spawn-found, etc.
+        # Without retry these escape to SB3 which has no recovery path.
+        last_err = None
+        for attempt in range(3):
+            try:
+                return self._reset_once(seed=seed, options=options)
+            except RuntimeError as e:
+                last_err = e
+                print(f"[reset] attempt {attempt + 1}/3 failed: {e}")
+                try:
+                    self._destroy_actors()
+                except Exception:
+                    pass
+                time.sleep(1.0)
+        raise RuntimeError(f"reset() failed after 3 attempts: {last_err}")
+
+    def _reset_once(self, seed=None, options=None):
         self._destroy_actors()
         self.collision_history = []
         self.image = None
@@ -151,6 +168,11 @@ class CarlaEnv(gym.Env):
         self._prev_seg_t = 0.0
         self._prev_seg_idx = 0
         self._progress_window = []
+        # Telemetry: count how many reward-side guards trip per episode.
+        self._reward_clip_hits = 0
+        self._progress_clamp_hits = 0
+        # Updated whenever progress_delta > 0.5m; used by 30s "really stuck" net.
+        self._last_significant_progress_step = 0
 
         # Weather randomization
         if self.enable_weather_randomization:
@@ -184,36 +206,72 @@ class CarlaEnv(gym.Env):
                 yaw_diff = 360 - yaw_diff
             if yaw_diff > 60:
                 continue
-            # Check that the road ahead isn't immediately blocked
-            nexts = wp.next(5.0)
+            # Check that the road ahead isn't immediately blocked.
+            # 15m lookahead (was 5m) — one full intersection block,
+            # so we don't spawn into a route that immediately dead-ends
+            # and triggers off-route termination.
+            nexts = wp.next(15.0)
             if nexts:
                 valid_spawns.append(sp)
         print(f"[spawn-filter] {len(valid_spawns)}/{len(spawn_points)} spawn points "
               f"passed driving-lane filter")
         if not valid_spawns:
-            print("[spawn-filter] WARNING: filter rejected ALL spawn points, "
-                  "using unfiltered list (this should not happen)")
-            valid_spawns = spawn_points  # fallback to all if filter too aggressive
+            # Don't silently fall back to unfiltered — that's how the agent
+            # ends up spawning on a sidewalk facing the wrong way and then
+            # U-turns onto oncoming traffic. Raise so reset() retries cleanly.
+            raise RuntimeError("Spawn filter produced 0 valid points")
         random.shuffle(valid_spawns)
         self.vehicle = None
         start_sp = None
         spawn_failures = 0
+        yaw_rejects = 0
         for sp in valid_spawns:
             try:
-                self.vehicle = self.world.spawn_actor(bp, sp)
-                start_sp = sp
-                wp = self.map.get_waypoint(sp.location, project_to_road=True,
-                                            lane_type=carla.LaneType.Driving)
-                print(f"[spawn] spawned at ({sp.location.x:.1f}, {sp.location.y:.1f}, "
-                      f"{sp.location.z:.1f}), nearest driving wp dist={sp.location.distance(wp.transform.location):.2f}m, "
-                      f"lane={wp.lane_type}, road_id={wp.road_id}, lane_id={wp.lane_id} "
-                      f"(after {spawn_failures} failed attempts)")
-                break
+                v = self.world.spawn_actor(bp, sp)
             except RuntimeError:
                 spawn_failures += 1
                 continue
+            # Settle physics and re-verify yaw alignment AFTER the spawn —
+            # CARLA can drop the actor slightly off, and the strict pre-filter
+            # (60deg) doesn't account for post-spawn rotation. 30deg is the
+            # tighter post-spawn tolerance; misaligned spawns get destroyed.
+            try:
+                self.world.tick()
+            except Exception:
+                pass
+            try:
+                veh_yaw = v.get_transform().rotation.yaw
+                wp = self.map.get_waypoint(sp.location, project_to_road=True,
+                                           lane_type=carla.LaneType.Driving)
+                wp_yaw = wp.transform.rotation.yaw
+                yd = abs(veh_yaw - wp_yaw) % 360
+                if yd > 180:
+                    yd = 360 - yd
+                if yd > 30:
+                    try:
+                        v.destroy()
+                    except Exception:
+                        pass
+                    yaw_rejects += 1
+                    continue
+                self.vehicle = v
+                start_sp = sp
+                print(f"[spawn] at ({sp.location.x:.1f}, {sp.location.y:.1f}), "
+                      f"yaw_diff={yd:.1f}deg, road_id={wp.road_id}, lane_id={wp.lane_id} "
+                      f"({spawn_failures} failed, {yaw_rejects} yaw-rejected)")
+                break
+            except Exception as e:
+                try:
+                    v.destroy()
+                except Exception:
+                    pass
+                spawn_failures += 1
+                continue
         if self.vehicle is None:
-            raise RuntimeError("No free spawn point found")
+            raise RuntimeError(
+                f"No valid spawn after {spawn_failures} failures, "
+                f"{yaw_rejects} yaw-rejects"
+            )
 
         # Generate route to a distant spawn point
         self._generate_route(start_sp, spawn_points)
@@ -243,14 +301,30 @@ class CarlaEnv(gym.Env):
         # Wait for first image BEFORE spawning traffic — if traffic spawns
         # first, NPCs can collide with the ego vehicle during the image wait,
         # terminating the episode before the agent ever acts.
-        for _ in range(30):
-            self.world.tick()
+        # CRITICAL: never proceed with self.image == None. A black image
+        # contaminates the frame-stack for 4 timesteps and is a primary
+        # cause of figure-8 / circling at episode start. Raise so reset()
+        # retries; if all retries fail, the trainer crashes cleanly and
+        # the watchdog restarts.
+        got_image = False
+        for _ in range(100):  # ~5s sim time, ~5-15s wall
+            try:
+                self.world.tick()
+            except RuntimeError as e:
+                # Server hiccup mid-tick. One retry, then raise.
+                print(f"[reset] world.tick() raised {e}; retrying once")
+                time.sleep(0.5)
+                self.world.tick()
             if self.image is not None:
+                got_image = True
                 break
             time.sleep(0.01)
 
-        if self.image is None:
-            print("[warning] camera did not deliver a frame after 30 ticks")
+        if not got_image:
+            raise RuntimeError(
+                f"Camera failed to deliver first frame after 100 ticks "
+                f"(port={self.port}). Will retry reset()."
+            )
 
         # Spawn traffic after ego is settled and camera is active
         if self.enable_traffic:
@@ -277,7 +351,19 @@ class CarlaEnv(gym.Env):
                 throttle=0.0, steer=steer, brake=0.0
             ))
 
-        self.world.tick()
+        # Defensive tick: a single transient server hiccup shouldn't kill the
+        # whole rollout. One reconnect+retry, then surface the failure.
+        try:
+            self.world.tick()
+        except RuntimeError as e:
+            print(f"[step] world.tick() raised {e}; reconnecting and retrying once")
+            try:
+                self.client = carla.Client(CARLA_HOST, self.port)
+                self.client.set_timeout(20.0)
+                self.world = self.client.get_world()
+                self.world.tick()
+            except Exception as e2:
+                raise RuntimeError(f"world.tick() failed after reconnect: {e2}")
 
         obs = self._get_obs()
         reward, terminated = self._compute_reward(action)
@@ -287,33 +373,41 @@ class CarlaEnv(gym.Env):
         if self.stagnation_counter > 200:
             truncated = True
 
-        # DEBUG: log WHY every episode ends
+        # DEBUG: log WHY every episode ends. ROUTE_COMPLETE and REALLY_STUCK
+        # already printed inline; this fills in the rest.
         if terminated or truncated:
-            reason = "UNKNOWN"
+            speed = self._get_speed()
+            rc = self._get_route_completion()
             if len(self.collision_history) > 0:
                 reason = "COLLISION"
             elif self.stagnation_counter > 200:
                 reason = f"STAGNATION (counter={self.stagnation_counter})"
-            elif (self.step_count > 80
-                  and len(self._progress_window) >= 80
-                  and sum(self._progress_window) < 5.0):
+            elif (self.step_count > 120
+                  and len(self._progress_window) >= 120
+                  and sum(self._progress_window) < 8.0):
                 reason = "CIRCLING"
             elif self.step_count >= self.max_episode_steps:
                 reason = "MAX_STEPS"
+            elif rc > 0.85:
+                reason = "ROUTE_COMPLETE"
             else:
                 reason = "OFF_ROUTE"
-            speed = self._get_speed()
-            rc = self._get_route_completion()
-            print(f"[EPISODE END] reason={reason} steps={self.step_count} "
-                  f"({self.step_count*0.05:.1f}s) speed={speed:.1f}m/s "
-                  f"route={rc*100:.1f}% stag={self.stagnation_counter} "
-                  f"progress={self.route_progress:.1f}m/{self.total_route_length:.0f}m")
+            # Skip duplicate print for reasons that print inline at trigger time.
+            if reason not in ("ROUTE_COMPLETE",):
+                print(f"[EPISODE END] reason={reason} steps={self.step_count} "
+                      f"({self.step_count*0.05:.1f}s) speed={speed:.1f}m/s "
+                      f"route={rc*100:.1f}% stag={self.stagnation_counter} "
+                      f"progress={self.route_progress:.1f}m/{self.total_route_length:.0f}m "
+                      f"clip_hits={self._reward_clip_hits} "
+                      f"prog_clamp_hits={self._progress_clamp_hits}")
 
         info = {
             "route_completion": self._get_route_completion(),
             "speed": self._get_speed(),
             "collisions": len(self.collision_history),
             "step": self.step_count,
+            "reward_clip_hits": self._reward_clip_hits,
+            "progress_clamp_hits": self._progress_clamp_hits,
         }
 
         return obs, reward, terminated, truncated, info
@@ -431,6 +525,18 @@ class CarlaEnv(gym.Env):
             self._prev_seg_t = t
             self._prev_seg_idx = self.route_index
 
+        # Clamp to physically plausible per-step range.
+        # MAX_SPEED * dt = 14.0 * 0.05 = 0.7m, so 1.5m gives 2x margin.
+        # Anything bigger is a projection bug, route swap, or collision rebound.
+        # A negative delta means a U-turn or reverse; we discard (don't reward).
+        # Without this clamp a single bad projection produces a +200 reward
+        # spike that blows out the value function and NaNs PPO.
+        if not math.isfinite(progress_delta) or progress_delta < 0.0:
+            self._progress_clamp_hits += 1
+            return 0.0
+        if progress_delta > 1.5:
+            self._progress_clamp_hits += 1
+            return 1.5
         return progress_delta
 
     def _get_route_completion(self):
@@ -466,8 +572,12 @@ class CarlaEnv(gym.Env):
         # This gives a clear signal: going faster toward target = good.
         if speed < TARGET_SPEED:
             speed_reward = 0.3 * (speed / TARGET_SPEED)
+        elif speed < MAX_SPEED:
+            speed_reward = 0.3 * (1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
         else:
-            speed_reward = 0.3 * max(0.0, 1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
+            # Over MAX_SPEED: no reward, no penalty. Don't divide-by-zero.
+            # Collision termination handles dangerous overspeed naturally.
+            speed_reward = 0.0
 
         # Only speed reward when facing the right direction.
         # Require alignment > 0.7 (~45°) — eliminates reward for circling.
@@ -498,36 +608,61 @@ class CarlaEnv(gym.Env):
                                              carla.TrafficLightState.Yellow):
                     at_red_light = True
 
+        # Is the car blocked by a vehicle in its lane?  If so, don't
+        # punish it for not making progress (gates the circling check
+        # AND prevents stagnation false-positives in queued traffic).
+        blocked_ahead = self._is_blocked_by_vehicle()
+
         # (a) Stagnation counter — catches stopped/crawling cars
         no_progress = progress_delta < 0.01
-        if (speed < 0.5 or no_progress) and not at_red_light:
+        if (speed < 0.5 or no_progress) and not at_red_light and not blocked_ahead:
             self.stagnation_counter += 1
         else:
             self.stagnation_counter = max(0, self.stagnation_counter - 1)
 
         # (b) Rolling progress window — catches circling at speed.
-        # 80-step window (4 sec), 5m threshold. Only starts checking
-        # after step 80 so the car has time to accelerate and orient.
+        # 120-step window (6 sec), 8m threshold. Looser than before to
+        # avoid false-positives in dense traffic. The 30s "really stuck"
+        # net below catches the cases this window now misses.
         self._progress_window.append(progress_delta)
-        if len(self._progress_window) > 80:
+        if len(self._progress_window) > 120:
             self._progress_window.pop(0)
+        if progress_delta > 0.5:
+            self._last_significant_progress_step = self.step_count
 
         # 4. Collision — small explicit penalty + episode termination.
-        # The real cost is losing all future route progress reward.
-        # At 0.42/step with 1000+ steps remaining, the opportunity cost
-        # of crashing at step 100 is ~400+.  The -5 is just a hint.
         terminated = False
         if len(self.collision_history) > 0:
             reward = -5.0
             terminated = True
 
-        # 5. Off-route — terminate if too far from planned route.
+        # 5. Route completion — one-shot terminal bonus when ego reaches goal.
+        # Without this, a successfully-completed route just runs to max_steps,
+        # which the user perceives as "ends abruptly without finishing".
+        # Bonus = +10.0 (= clip_reward cap, so VecNormalize can't amplify it).
+        # Gated on rc > 0.85 so the agent can't farm by spawning near the goal.
+        if not terminated and self.route and len(self.route) >= 2:
+            final_wp = self.route[-1].transform.location
+            ego_loc_g = self.vehicle.get_location()
+            dist_to_goal = ego_loc_g.distance(final_wp)
+            rc = self._get_route_completion()
+            if (dist_to_goal < 5.0 and rc > 0.85) or self.route_index >= len(self.route) - 2:
+                reward = 10.0
+                terminated = True
+                print(f"[EPISODE END] reason=ROUTE_COMPLETE "
+                      f"dist={dist_to_goal:.1f}m rc={rc:.2%} "
+                      f"step={self.step_count}")
+
+        # 6. Off-route — terminate if too far from planned route.
         # Skip first 20 steps: spawn→route alignment isn't always perfect.
-        if (self.step_count > 20 and self.route
+        # Backward window widened from -5 to -20 to handle U-turns/roundabouts
+        # where the route doubles back and the agent can be physically close
+        # to a route waypoint that's >5 indices behind the current cursor.
+        if (not terminated and self.step_count > 20 and self.route
                 and self.route_index < len(self.route)):
             ego_loc = self.vehicle.get_location()
             end_idx = min(self.route_index + 50, len(self.route))
-            start_idx = max(0, self.route_index - 5)
+            start_idx = max(0, self.route_index - 20)
             dist_to_route = min(
                 ego_loc.distance(self.route[i].transform.location)
                 for i in range(start_idx, end_idx)
@@ -536,18 +671,67 @@ class CarlaEnv(gym.Env):
                 reward = -5.0
                 terminated = True
 
-        # 6. Rolling progress check — catches circling at speed.
-        # Starts after step 80 (4 sec warmup for acceleration/orienting).
-        # 80-step window, 5m threshold. Circling at 8m/s covers ~32m
-        # but <5m route progress = obvious circling.
-        if (self.step_count > 80
-                and len(self._progress_window) >= 80
-                and sum(self._progress_window) < 5.0
-                and not at_red_light):
+        # 7. Rolling progress check — catches circling at speed.
+        # Now 120 steps (6s), 8m threshold (~1.3 m/s avg). Skip when at red
+        # light OR blocked by vehicle ahead — both legitimate reasons to slow.
+        if (not terminated
+                and self.step_count > 120
+                and len(self._progress_window) >= 120
+                and sum(self._progress_window) < 8.0
+                and not at_red_light
+                and not blocked_ahead):
             terminated = True
             reward = -5.0
 
+        # 8. "Really stuck" safety net — 30s without ANY meaningful progress.
+        # Independent of red-light/blocked gating: even legitimate red lights
+        # cycle in <30s; if you've gone 30s with no >0.5m progress event you
+        # are stuck and waiting won't unstick you.
+        if (not terminated
+                and self.step_count - self._last_significant_progress_step > 600):
+            terminated = True
+            reward = -5.0
+            print(f"[EPISODE END] reason=REALLY_STUCK "
+                  f"steps_since_progress={self.step_count - self._last_significant_progress_step}")
+
+        # Final defensive clip BEFORE VecNormalize sees the reward.
+        # VecNormalize's clip_reward=10.0 only clips the *normalized* reward —
+        # an Inf raw reward still poisons its running mean/var permanently.
+        if not math.isfinite(reward):
+            print(f"[reward-guard] non-finite reward {reward} -> 0.0; terminating")
+            reward = 0.0
+            terminated = True
+        if reward > 10.0 or reward < -10.0:
+            self._reward_clip_hits += 1
+            reward = max(-10.0, min(10.0, reward))
+
         return reward, terminated
+
+    def _is_blocked_by_vehicle(self):
+        """True if there's another vehicle within 8m forward in our lane.
+
+        Used to gate stagnation/circling checks: queued behind a bus
+        at a green light is not the same as actually being stuck.
+        """
+        if self.vehicle is None:
+            return False
+        try:
+            ego_t = self.vehicle.get_transform()
+            ego_loc = ego_t.location
+            yaw_r = math.radians(ego_t.rotation.yaw)
+            fx, fy = math.cos(yaw_r), math.sin(yaw_r)
+            for other in self.world.get_actors().filter("vehicle.*"):
+                if other.id == self.vehicle.id:
+                    continue
+                ol = other.get_location()
+                dx, dy = ol.x - ego_loc.x, ol.y - ego_loc.y
+                forward = dx * fx + dy * fy
+                lateral = -dx * fy + dy * fx
+                if 0.0 < forward < 8.0 and abs(lateral) < 2.0:
+                    return True
+        except Exception:
+            return False
+        return False
 
     # ------------------------------------------------------------------
     # OBSERVATION (GAP 4 fix — expanded state vector + single channel image)

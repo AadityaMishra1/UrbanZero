@@ -26,14 +26,18 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 
 from env.carla_env import CarlaEnv
+from env.safety_wrapper import NaNGuardWrapper
 from models.cnn_extractor import DrivingCNN
 from models.clamped_policy import ClampedStdPolicy
 from eval.evaluator import DrivingMetricsCallback
+from eval.beacon_callback import BeaconCallback
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecFrameStack
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList, BaseCallback
 import torch
 import time as _time
+import random
+import numpy as np
 
 
 class WallClockCheckpointCallback(BaseCallback):
@@ -99,6 +103,10 @@ def make_env(rank, base_port, enable_traffic, enable_weather):
             num_traffic_vehicles=30,
             num_pedestrians=10,
         )
+        # Boundary NaN/Inf guard — turns silent corruption into a logged
+        # forced-terminal so VecNormalize never absorbs an Inf and PPO
+        # never sees a NaN obs.
+        env = NaNGuardWrapper(env)
         return env
     return _init
 
@@ -106,8 +114,19 @@ def make_env(rank, base_port, enable_traffic, enable_weather):
 def main():
     args = parse_args()
 
+    # Seed everything reproducibly so a "weird run" is at least the same
+    # weird run twice. Per-env CARLA RNG (TM, weather, spawn) still varies
+    # because it derives from random.randint() calls inside CarlaEnv.reset().
+    seed = int(os.environ.get("URBANZERO_SEED", "42"))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     LOG_DIR = os.path.expanduser(f"~/urbanzero/logs/{args.experiment}")
     CKPT_DIR = os.path.expanduser(f"~/urbanzero/checkpoints/{args.experiment}")
+    BEACON_PATH = os.path.expanduser("~/urbanzero/beacon.json")
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CKPT_DIR, exist_ok=True)
 
@@ -149,7 +168,7 @@ def main():
             print(f"  Loaded VecNormalize stats from {vecnorm_path}")
         else:
             print(f"  Warning: {vecnorm_path} not found, using fresh VecNormalize")
-            env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+            env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0, clip_obs=10.0)
     else:
         env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
@@ -170,7 +189,17 @@ def main():
     wallclock_cb = WallClockCheckpointCallback(
         save_path=CKPT_DIR, save_minutes=10, verbose=1,
     )
-    callbacks = CallbackList([checkpoint_cb, metrics_cb, wallclock_cb])
+    # Progress beacon: writes ~/urbanzero/beacon.json every 30s. The watchdog
+    # uses its mtime to detect a hung trainer; the user uses it to glance
+    # at training health without attaching to tmux.
+    beacon_cb = BeaconCallback(
+        beacon_path=BEACON_PATH,
+        experiment=args.experiment,
+        carla_port=args.base_port,
+        write_seconds=30,
+        verbose=1,
+    )
+    callbacks = CallbackList([checkpoint_cb, metrics_cb, wallclock_cb, beacon_cb])
 
     # PPO with custom CNN extractor
     policy_kwargs = dict(
