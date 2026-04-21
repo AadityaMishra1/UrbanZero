@@ -1,6 +1,9 @@
 #!/bin/bash
 # Start training + spectator in a single tmux session.
-# Usage: bash scripts/start_training.sh [checkpoint_path]
+# Usage:
+#   bash scripts/start_training.sh [checkpoint_path] [--no-traffic] [--no-weather]
+# First positional arg (if it's a .zip path) becomes --resume. Subsequent args
+# are forwarded verbatim to agents/train.py.
 #
 # Honors env vars (set these instead of editing this file):
 #   CARLA_PYTHONAPI  path to CARLA's PythonAPI/carla dir
@@ -17,6 +20,8 @@
 #   URBANZERO_BASE_PORT  base CARLA port (default 2000)
 #   URBANZERO_TIMESTEPS  total training steps (default 10_000_000)
 #   URBANZERO_SEED   RNG seed (default 42)
+#   URBANZERO_EXTRA_ARGS  free-form args passed through to train.py (e.g.
+#                         "--no-traffic --no-weather")
 #   URBANZERO_SKIP_PREFLIGHT  if set, skip preflight (use only when debugging)
 
 set -uo pipefail
@@ -37,12 +42,30 @@ mkdir -p "$CKPT_DIR" "$LOG_DIR"
 
 ACTIVATE="source '$VENV' && export PYTHONPATH=\$PYTHONPATH:'$CARLA_PYTHONAPI' && export URBANZERO_SEED='$SEED' && cd '$REPO'"
 
-# Find checkpoint: use arg, or latest autosave/ppo/emergency.
-CKPT="${1:-$(ls -t "$CKPT_DIR"/autosave_*_steps.zip "$CKPT_DIR"/ppo_urbanzero_*_steps.zip "$CKPT_DIR"/emergency_*_steps.zip 2>/dev/null | head -1)}"
+# Parse args: first positional arg is an optional checkpoint path. Anything
+# else is passed verbatim to train.py (e.g. --no-traffic, --no-weather).
+CKPT=""
+EXTRA_ARGS="${URBANZERO_EXTRA_ARGS:-}"
+if [ "$#" -ge 1 ]; then
+    if [ -f "$1" ] && [[ "$1" == *.zip ]]; then
+        CKPT="$1"; shift
+    fi
+    # Remaining args (if any) append to EXTRA_ARGS.
+    if [ "$#" -gt 0 ]; then
+        EXTRA_ARGS="$EXTRA_ARGS $*"
+    fi
+fi
+# Fall back to latest checkpoint in this experiment's dir if none specified.
+if [ -z "$CKPT" ]; then
+    CKPT="$(ls -t "$CKPT_DIR"/autosave_*_steps.zip "$CKPT_DIR"/ppo_urbanzero_*_steps.zip "$CKPT_DIR"/emergency_*_steps.zip 2>/dev/null | head -1)"
+fi
 RESUME=""
 if [ -n "$CKPT" ] && [ -f "$CKPT" ]; then
     RESUME="--resume '$CKPT'"
     echo "Resuming from: $CKPT"
+fi
+if [ -n "$EXTRA_ARGS" ]; then
+    echo "Extra train.py args: $EXTRA_ARGS"
 fi
 
 # Pre-flight: refuse to launch if CARLA/disk/GPU/deps aren't ready.
@@ -78,7 +101,7 @@ fi
 TS="$(date +%Y%m%d_%H%M%S)"
 tmux new-session -d -s urbanzero -x 200 -y 50
 tmux send-keys -t urbanzero:0.0 \
-  "$ACTIVATE && python3 -u agents/train.py --experiment '$EXPERIMENT' --n-envs '$N_ENVS' --base-port '$BASE_PORT' --timesteps '$TIMESTEPS' $RESUME 2>&1 | tee '$LOG_DIR/train_${TS}.log'" Enter
+  "$ACTIVATE && python3 -u agents/train.py --experiment '$EXPERIMENT' --n-envs '$N_ENVS' --base-port '$BASE_PORT' --timesteps '$TIMESTEPS' $RESUME $EXTRA_ARGS 2>&1 | tee '$LOG_DIR/train_${TS}.log'" Enter
 
 # Spectator runs in its own session — start only if not already running.
 if ! tmux has-session -t spectator 2>/dev/null; then

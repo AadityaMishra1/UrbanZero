@@ -690,7 +690,15 @@ class CarlaEnv(gym.Env):
                 d = 360 - d
             route_alignment = math.cos(math.radians(d))
         legit_queue = blocked_ahead and route_alignment > 0.5
-        legit_stop = at_red_light or legit_queue  # OK to be stationary here
+        # Red light is the only truly legitimate reason to be stationary.
+        # Being queued behind traffic is NOT free — the previous version's
+        # `legit_stop = at_red_light OR legit_queue` over-gated: with 30
+        # NPCs around spawn, blocked_ahead almost always fires, so the
+        # idle penalty never activated and the agent learned to stand
+        # still forever (172k-step clean run, 94% stagnation, 0.009 m/s).
+        # Queueing should still cost a little — that's a gradient to find
+        # a route around or at least follow the traffic when it moves.
+        legit_stop = at_red_light
 
         # Smooth idle penalty — continuous ramp, no cliff at speed=1.0.
         # Before: step function 0 -> -0.3 -> -1.0 with a discontinuity
@@ -707,11 +715,14 @@ class CarlaEnv(gym.Env):
         reward = progress_reward + speed_reward + lateral_penalty + smoothness_penalty + idle_penalty
 
         # Stagnation counter — catches stopped/crawling cars.
-        # Gates (at_red_light, legit_queue) were computed above for idle_penalty;
-        # reused here so stagnation and idle penalty agree on what "legitimate
-        # stopping" means.
+        # Truncates after 150 steps (7.5s). More permissive gating than
+        # the per-step idle penalty: we don't want to truncate the agent
+        # while it's correctly queued behind traffic at a green light
+        # (that's a 10-30s wait in CARLA traffic density). So the
+        # counter skips both red lights AND legit queues; the idle
+        # penalty only skips red lights.
         no_progress = progress_delta < 0.01
-        if (speed < 0.5 or no_progress) and not legit_stop:
+        if (speed < 0.5 or no_progress) and not at_red_light and not legit_queue:
             self.stagnation_counter += 1
         else:
             self.stagnation_counter = max(0, self.stagnation_counter - 1)

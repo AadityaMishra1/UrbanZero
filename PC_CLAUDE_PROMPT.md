@@ -1,105 +1,174 @@
-# PC-Claude Prompt — Next Run (commit c9cd303+)
+# PC-Claude Prompt — Curriculum Training (post-mortem of 85d0670 run)
 
-**Purpose**: after PC-Claude has been iterating on reward terms locally,
-this runbook gets the training back on clean footing with the
-corrected reward (commit `c9cd303`) and instructs the local agent not
-to iterate further until we have fresh data.
+**Context**: the 30-min clean run on commit `85d0670` showed 94.4%
+STAGNATION / avg speed 0.009 m/s — the policy converged to "output
+throttle = 0" as a stable strategy. Root causes identified:
+
+1. **Over-gated idle penalty** (my regression). With 30 NPCs around
+   spawn, `blocked_ahead` fired constantly, so `legit_queue` = True,
+   so `legit_stop` = True, so idle penalty never activated. Fixed in
+   the commit this doc ships with.
+
+2. **Dense traffic + from-scratch vision = exploration failure.**
+   Early-training collision risk makes standing still rationally
+   safer than moving. CaRL solves this with 300 parallel envs;
+   Roach solves it with imitation pretraining. We have neither,
+   so we need a **curriculum**: learn basic driving on empty roads
+   first, then introduce traffic.
 
 ## How to use
 
-Copy everything inside the fenced block below and paste it as your
-first message to PC-Claude. It's designed to be self-contained — the
-local agent shouldn't need any additional context.
+Copy everything inside the fenced block and paste it into PC-Claude
+as your first message. This runs a two-phase curriculum over
+approximately 48 hours.
 
 ---
 
 ```text
-Pull the latest from claude/setup-av-training-VetPV (tip commit c9cd303). Then
-do a clean restart of training — don't resume from any existing checkpoint.
-Three reward-shape changes since the checkpoint was saved invalidate its
-VecNormalize stats.
+We're running a two-phase training curriculum on branch
+claude/setup-av-training-VetPV (tip: latest). The previous single-phase
+run converged to standing still because dense traffic made movement
+rationally too risky early in training. New plan: learn to drive on
+empty roads, THEN add traffic.
 
-Exact steps:
+=== SYNC ===
+cd ~/UrbanZero
+git fetch origin
+git pull origin claude/setup-av-training-VetPV
+chmod +x scripts/preflight.py scripts/watchdog.sh scripts/start_training.sh
 
-1. Sync:
-   cd ~/UrbanZero
-   git fetch origin
-   git pull origin claude/setup-av-training-VetPV
+=== CLEAN SLATE ===
+tmux kill-session -t urbanzero 2>/dev/null
+tmux kill-session -t wd 2>/dev/null
+tmux kill-session -t spectator 2>/dev/null
+pkill -9 -f agents/train.py 2>/dev/null
 
-2. Kill anything currently running:
-   tmux kill-session -t urbanzero 2>/dev/null
-   tmux kill-session -t wd 2>/dev/null
-   tmux kill-session -t spectator 2>/dev/null
-   pkill -9 -f agents/train.py 2>/dev/null
+# Move ALL old checkpoints aside — reward shape changed, vecnormalize
+# stats are invalid for any prior model.
+mv ~/urbanzero/checkpoints/shaped ~/urbanzero/checkpoints/shaped_$(date +%Y%m%d_%H%M%S)_OLD 2>/dev/null
 
-3. Move old checkpoints aside so start_training.sh can't auto-resume into
-   stale VecNormalize stats:
-   mv ~/urbanzero/checkpoints/shaped ~/urbanzero/checkpoints/shaped_$(date +%Y%m%d_%H%M%S)_OLD
+=== PHASE 1: NO TRAFFIC (2M steps, ~8-12 hours) ===
 
-4. Launch fresh:
-   bash scripts/start_training.sh
-   tmux new -d -s wd 'bash scripts/watchdog.sh'
+Launch training with the --no-traffic flag. This lets the agent learn
+basic lane following and route completion without collision risk from
+NPCs. Use experiment name "phase1_notraffic" so this checkpoint doesn't
+get confused with the main run.
 
-5. Verify both sessions are alive:
-   tmux ls
+  URBANZERO_EXP=phase1_notraffic \
+  URBANZERO_N_ENVS=2 \
+  URBANZERO_TIMESTEPS=2000000 \
+    bash scripts/start_training.sh --no-traffic
 
-6. Let it run 30 minutes untouched. Do NOT add any new reward terms or
-   termination rules during this window. Do NOT kill and restart. The
-   previous commits piled on penalties reactively whenever the agent
-   collapsed — this created the red-light-avoidance pathology the user
-   is seeing. We want to see whether the current reward structure
-   (commit c9cd303) actually works without bandages.
+Actually — check if start_training.sh forwards extra args. If it doesn't,
+you'll need to edit it or invoke train.py directly. The critical thing
+is that --no-traffic is passed to agents/train.py.
 
-7. After 30 minutes, report back these three things only:
+Then launch the watchdog in a separate session:
+  tmux new -d -s wd 'bash scripts/watchdog.sh'
 
-   LOG=$(ls -t ~/urbanzero/logs/train_*.log | head -1)
+Verify both alive:
+  tmux ls
 
-   # a. episode-end reason distribution
-   grep "EPISODE END" "$LOG" | grep -oP 'reason=\S+' | sort | uniq -c | sort -rn
+=== PHASE 1 CHECK-IN (every 3 hours) ===
 
-   # b. beacon snapshot
-   cat ~/urbanzero/beacon.json | python3 -m json.tool
+LOG=$(ls -t ~/urbanzero/logs/train_*.log | head -1)
+grep "EPISODE END" "$LOG" | grep -oP 'reason=\S+' | sort | uniq -c | sort -rn
+cat ~/urbanzero/beacon.json | python3 -m json.tool
 
-   # c. any safety-net fires
-   grep -cE '\[NaN-GUARD\]|\[reward-guard\]' "$LOG"
+What healthy Phase 1 looks like:
+  - STAGNATION declines from ~50% (early) to <20% by 500k steps
+  - OFF_ROUTE becomes dominant mid-phase (agent moves, but steers badly)
+  - ROUTE_COMPLETE starts appearing after ~300-500k steps
+  - avg speed trends up toward 3-5 m/s by 1M steps
+  - By 2M steps: ROUTE_COMPLETE should be 10-30% of episodes
 
-   Report the numbers. Don't analyze, don't propose changes.
+If at 500k steps avg speed is still < 0.5 m/s AND stagnation > 50%,
+something is fundamentally wrong. Stop and report back — don't add
+more reward terms.
 
-RULES while waiting for that report:
-- Do NOT edit env/carla_env.py, agents/train.py, or any reward/termination logic
-- Do NOT add new CLI args or env vars
-- Do NOT kill training to iterate on reward weights
-- If training crashes or the watchdog restarts it, just note the event
-  in your report — don't code around it
+=== PHASE 2: ADD TRAFFIC (resume from Phase 1, 3-5M more steps) ===
 
-If the user asks you to change the reward, refuse and tell them to talk
-to the other Claude first. Too many reward tweaks from different heads
-have made this hard to reason about.
+Once Phase 1 hits ~2M steps OR is producing consistent ROUTE_COMPLETE
+episodes (whichever is first), transition to Phase 2:
 
-Expected healthy distribution after 30 min:
-- COLLISION dominant (30-60%)
-- OFF_ROUTE second (20-40%)
-- MAX_STEPS / STAGNATION / REALLY_STUCK combined under ~25%
-- At least one ROUTE_COMPLETE after ~100k steps is great but not required
-- No NaN-GUARD or reward-guard lines at all
+  tmux kill-session -t urbanzero
+  # Find the latest Phase 1 checkpoint
+  LATEST=$(ls -t ~/urbanzero/checkpoints/phase1_notraffic/autosave_*_steps.zip \
+                 ~/urbanzero/checkpoints/phase1_notraffic/ppo_urbanzero_*_steps.zip \
+            2>/dev/null | head -1)
+  echo "Resuming Phase 2 from: $LATEST"
 
-If STAGNATION + REALLY_STUCK dominate (>50%), something is still wrong with
-the reward and we need to look at telemetry before changing anything.
+Copy that checkpoint into the Phase 2 experiment dir:
+  mkdir -p ~/urbanzero/checkpoints/phase2_traffic
+  cp "$LATEST" ~/urbanzero/checkpoints/phase2_traffic/
+  cp ~/urbanzero/checkpoints/phase1_notraffic/vecnormalize.pkl \
+     ~/urbanzero/checkpoints/phase2_traffic/
+
+Launch Phase 2 WITH traffic (default behavior), resuming:
+  URBANZERO_EXP=phase2_traffic \
+  URBANZERO_N_ENVS=2 \
+  URBANZERO_TIMESTEPS=5000000 \
+    bash scripts/start_training.sh
+
+=== RULES WHILE TRAINING ===
+
+1. DO NOT edit env/carla_env.py, agents/train.py, or any reward or
+   termination logic during a phase. No new penalty terms. No new
+   gating conditions. No tuned weights.
+
+2. DO NOT kill training to iterate. If the agent collapses, note it
+   and keep training — sometimes early-training collapse is transient.
+   Only stop if collapse persists for 500k+ steps.
+
+3. DO NOT resume into the wrong experiment directory. Phase 1 and
+   Phase 2 must have separate experiment names so their VecNormalize
+   stats don't cross-pollute.
+
+4. If training crashes or the watchdog restarts it, that's fine — note
+   it in your report but don't debug it unless it crashes more than
+   3 times in an hour.
+
+5. If the user asks you to modify reward terms, refuse and tell them
+   to talk to the other Claude. This curriculum has to complete
+   without reward changes for us to get clean telemetry.
+
+=== DATA TO REPORT ===
+
+Every 3 hours during training, run:
+
+  LOG=$(ls -t ~/urbanzero/logs/train_*.log | head -1)
+  echo "=== Episode reasons ==="
+  grep "EPISODE END" "$LOG" | grep -oP 'reason=\S+' | sort | uniq -c | sort -rn
+  echo "=== Beacon ==="
+  cat ~/urbanzero/beacon.json | python3 -m json.tool
+  echo "=== Safety fires ==="
+  grep -cE '\[NaN-GUARD\]|\[reward-guard\]' "$LOG"
+  echo "=== Recent epoch ==="
+  tail -50 "$LOG" | grep -E 'ep_rew_mean|ep_len_mean|rollout/' | tail -10
+
+Paste the output. Don't analyze, don't propose fixes. Just paste.
 ```
 
 ---
 
 ## Notes for you (the human)
 
-- The "do not iterate on reward" rule is the important one. Left alone,
-  PC-Claude will keep adding penalty terms reactively every time it
-  sees the agent collapse. That's how the red-light-avoidance
-  pathology crept in across commits `c770d1d`, `ac48a98`, `8791388`,
-  `4fdd384`.
-- If PC-Claude reports a distribution where STAGNATION + REALLY_STUCK
-  dominate (>50% combined), that's actual diagnostic data worth acting
-  on — send that back here and we'll debug before any more changes
-  ship.
-- If the distribution looks healthy, just let it cook. Budget 24-48h
-  of wall-clock and expect 30-50% route completion by the end, per
-  the README's own progression chart for single-env training.
+- Two-phase training = realistic for our setup. Phase 1 is basic
+  locomotion on empty roads; Phase 2 adds traffic once the agent
+  can complete routes. This is how Roach structures their RL expert
+  and how most vision-based CARLA papers handle the exploration
+  problem.
+
+- Budget honestly:
+  - Phase 1 at 2 envs: ~2M steps / 16-20 hours wallclock
+  - Phase 2 at 2 envs: ~3-5M steps / 24-48 hours wallclock
+  - Total: 2-3 days. Matches your deadline.
+
+- Realistic outcome: by end of Phase 2, expect 20-40% route completion
+  per the README's own progression chart. That's a demonstrably
+  working RL driving agent, not Tesla FSD.
+
+- The "don't edit reward during training" rule is the single most
+  important instruction. Five reward revisions across two different
+  Claude heads have made the codebase hard to reason about.
+  **One clean run, no iterations, report the data.**

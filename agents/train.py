@@ -113,7 +113,12 @@ def make_env(rank, base_port, enable_traffic, enable_weather, base_seed):
             max_episode_steps=3000,       # 150 seconds at 20Hz: enough room
                                           # for slow early agents to complete
                                           # 200-800m routes without timing out
-            num_traffic_vehicles=30,
+            # Traffic density reduced from 30 -> 15. 30 NPCs on a 200-800m
+            # route with only ~100 spawn points in a typical CARLA town is
+            # dense urban traffic — too intimidating for a from-scratch
+            # policy that hasn't yet learned basic locomotion. 15 gives the
+            # agent room to make mistakes without constant collision risk.
+            num_traffic_vehicles=15,
             num_pedestrians=10,
         )
         # Boundary NaN/Inf guard — turns silent corruption into a logged
