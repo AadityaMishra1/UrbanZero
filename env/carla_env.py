@@ -608,13 +608,7 @@ class CarlaEnv(gym.Env):
 
         # 2. Speed reward, signed by route alignment.
         # Triangle-shaped peak at TARGET_SPEED, falls to 0 at MAX_SPEED.
-        # Floor penalty: standing still or barely moving costs -0.2/step.
-        # This makes every slow step expensive (150 steps × -0.2 = -30 cumulative)
-        # and eliminates the counter-gaming exploit where the agent twitches
-        # just enough to decrement the stagnation counter while going nowhere.
-        if speed < 1.0:
-            speed_reward = -0.2
-        elif speed < TARGET_SPEED:
+        if speed < TARGET_SPEED:
             speed_reward = 0.3 * (speed / TARGET_SPEED)
         elif speed < MAX_SPEED:
             speed_reward = 0.3 * (1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
@@ -661,7 +655,23 @@ class CarlaEnv(gym.Env):
         d_throttle = throttle_brake - float(self.prev_action[1])
         smoothness_penalty = -0.05 * (d_steer * d_steer + d_throttle * d_throttle)
 
-        reward = progress_reward + speed_reward + lateral_penalty + smoothness_penalty
+        # 5. Idle penalty — unconditional, NOT scaled by alignment.
+        # Previous -0.2/step penalty was inside speed_reward and got flipped
+        # by negative alignment (agent got REWARDED for standing still while
+        # facing wrong way). Also too weak: 151 steps × -0.2 = -30, easily
+        # offset by ~50 steps of driving reward.
+        #
+        # New: -1.0/step when truly stopped (<0.5 m/s), -0.3 when crawling.
+        # 151 steps × -1.0 = -151 + -5.0 terminal = -156. No driving
+        # strategy can accumulate enough to make stop-then-die profitable.
+        if speed < 0.5:
+            idle_penalty = -1.0
+        elif speed < 1.0:
+            idle_penalty = -0.3
+        else:
+            idle_penalty = 0.0
+
+        reward = progress_reward + speed_reward + lateral_penalty + smoothness_penalty + idle_penalty
 
         # 3. Blocked/wrong-way detection.
         # Two mechanisms: (a) stagnation counter for stopped cars,
