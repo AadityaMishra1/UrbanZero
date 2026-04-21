@@ -382,7 +382,15 @@ class CarlaEnv(gym.Env):
 
         truncated = self.step_count >= self.max_episode_steps
         if self.stagnation_counter > 200:
-            truncated = True
+            # Stagnation must carry a penalty — without it, "stop moving" is
+            # a free truncation (reward ≈ 0) which PPO's critic learns is safer
+            # than driving (where collision risk makes V < 0). The agent then
+            # collapses into a local optimum of standing still.
+            # -2.0 is enough to make stopping worse than driving forward
+            # (per-step reward ≈ +1-2 when moving) but less harsh than
+            # collision (-5.0) so crash avoidance is still prioritized.
+            terminated = True
+            reward = -2.0
 
         # DEBUG: log WHY every episode ends. ROUTE_COMPLETE and REALLY_STUCK
         # also print inline at trigger; this is the unified summary.
