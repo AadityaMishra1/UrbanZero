@@ -381,16 +381,19 @@ class CarlaEnv(gym.Env):
         self.prev_action = np.array([steer, throttle_brake], dtype=np.float32)
 
         truncated = self.step_count >= self.max_episode_steps
-        if self.stagnation_counter > 200:
-            # Stagnation must carry a penalty — without it, "stop moving" is
-            # a free truncation (reward ≈ 0) which PPO's critic learns is safer
-            # than driving (where collision risk makes V < 0). The agent then
-            # collapses into a local optimum of standing still.
-            # -2.0 is enough to make stopping worse than driving forward
-            # (per-step reward ≈ +1-2 when moving) but less harsh than
-            # collision (-5.0) so crash avoidance is still prioritized.
+        if self.stagnation_counter > 150:
+            # Stagnation must carry a penalty equal to collision. At -2.0 and
+            # 200-step threshold, the agent learned to "drive 50 steps, stop
+            # 199 steps" — accumulating +50-100 from driving then eating only
+            # -2.0 for stopping. Net positive, so PPO kept the strategy.
+            #
+            # Fix: threshold 200→150 (7.5s, still gated on red lights and
+            # legit queues so real stops are unaffected) and penalty -2.0→-5.0
+            # (same as collision). Now stopping and crashing are equally bad,
+            # but driving forward gives +1-2/step. The only way to avoid both
+            # penalties is to keep moving — which is what we want.
             terminated = True
-            reward = -2.0
+            reward = -5.0
 
         # DEBUG: log WHY every episode ends. ROUTE_COMPLETE and REALLY_STUCK
         # also print inline at trigger; this is the unified summary.
