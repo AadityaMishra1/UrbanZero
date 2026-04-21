@@ -701,10 +701,14 @@ class CarlaEnv(gym.Env):
 
         # 5. Route completion — must REACH the goal AND PARK there.
         # Real driving means stopping at the destination, not just flying
-        # past at speed. Speed gate (<2 m/s) forces the agent to actually
-        # decelerate and stop near the goal to claim the +10 bonus.
-        # If the agent overshoots at speed, no bonus — episode continues
-        # until off-route or max-steps fires naturally.
+        # past at speed. Speed gate (<3 m/s = ~11 km/h = true parking-pace)
+        # forces deceleration to claim the +10 bonus.
+        # Fallback: if agent has been at the goal waypoint for more than
+        # 200 steps (10s) without parking, terminate with zero reward
+        # so we don't waste training budget on an agent that made it to
+        # the destination but can't decelerate. Avoids the "loiter near
+        # goal forever" trap where r_progress=0, r_speed=+0.3 keeps
+        # ticking until MAX_STEPS.
         if not terminated and self.route and len(self.route) >= 2:
             final_wp = self.route[-1].transform.location
             ego_loc_g = self.vehicle.get_location()
@@ -712,12 +716,23 @@ class CarlaEnv(gym.Env):
             rc = self._get_route_completion()
             at_goal = (dist_to_goal < 5.0 and rc > 0.85) or \
                       self.route_index >= len(self.route) - 2
-            if at_goal and speed < 2.0:
+            if at_goal and speed < 3.0:
                 reward = 10.0
                 terminated = True
                 print(f"[EPISODE END] reason=ROUTE_COMPLETE "
                       f"dist={dist_to_goal:.1f}m rc={rc:.2%} "
                       f"speed={speed:.2f}m/s step={self.step_count}")
+            elif at_goal:
+                # Track loiter steps; terminate if too long without parking.
+                self._at_goal_steps = getattr(self, "_at_goal_steps", 0) + 1
+                if self._at_goal_steps > 200:
+                    terminated = True
+                    reward = 0.0  # neither bonus nor penalty — just stop
+                    print(f"[EPISODE END] reason=REACHED_NO_PARK "
+                          f"dist={dist_to_goal:.1f}m speed={speed:.2f}m/s "
+                          f"step={self.step_count}")
+            else:
+                self._at_goal_steps = 0
 
         # 6. Off-route — terminate if too far from planned route.
         # Skip first 20 steps: spawn→route alignment isn't always perfect.
@@ -767,11 +782,21 @@ class CarlaEnv(gym.Env):
     def _is_blocked_by_vehicle(self):
         """True if there's another vehicle within 8m forward in our lane.
 
-        Used to gate stagnation/circling checks: queued behind a bus
-        at a green light is not the same as actually being stuck.
+        Used to gate stagnation checks: queued behind a bus at a green
+        light is not the same as actually being stuck.
+
+        Cached with a 10-step TTL (0.5s) — without caching this iterates
+        all world vehicles per step (30+ RPC calls/step per env). At
+        20Hz × 2 envs that's ~1200 CARLA RPCs/sec, a real throughput
+        bottleneck. Blocking state changes on >100ms timescales, so
+        caching is correctness-preserving.
         """
         if self.vehicle is None:
             return False
+        cache_step = getattr(self, "_blocked_cache_step", -999)
+        if self.step_count - cache_step < 10:
+            return getattr(self, "_blocked_cache_val", False)
+        result = False
         try:
             ego_t = self.vehicle.get_transform()
             ego_loc = ego_t.location
@@ -785,10 +810,13 @@ class CarlaEnv(gym.Env):
                 forward = dx * fx + dy * fy
                 lateral = -dx * fy + dy * fx
                 if 0.0 < forward < 8.0 and abs(lateral) < 2.0:
-                    return True
+                    result = True
+                    break
         except Exception:
-            return False
-        return False
+            result = False
+        self._blocked_cache_step = self.step_count
+        self._blocked_cache_val = result
+        return result
 
     # ------------------------------------------------------------------
     # OBSERVATION (GAP 4 fix — expanded state vector + single channel image)

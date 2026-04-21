@@ -91,9 +91,20 @@ def parse_args():
     return parser.parse_args()
 
 
-def make_env(rank, base_port, enable_traffic, enable_weather):
-    """Factory function for creating CARLA environments with unique ports."""
+def make_env(rank, base_port, enable_traffic, enable_weather, base_seed):
+    """Factory function for creating CARLA environments with unique ports.
+
+    Each worker gets a distinct RNG seed (base_seed + rank) so that under
+    SubprocVecEnv workers pick different spawn points / weather / traffic
+    patterns rather than cloning the main process's seeded RNG state.
+    Without this, domain randomization collapses to n_envs copies of the
+    same episode sequence.
+    """
     def _init():
+        import random as _random
+        worker_seed = base_seed + rank
+        _random.seed(worker_seed)
+        np.random.seed(worker_seed)
         port = base_port + rank * 1000
         env = CarlaEnv(
             port=port,
@@ -143,7 +154,7 @@ def main():
 
     # Create vectorized environment
     env_fns = [
-        make_env(i, args.base_port, not args.no_traffic, not args.no_weather)
+        make_env(i, args.base_port, not args.no_traffic, not args.no_weather, seed)
         for i in range(args.n_envs)
     ]
 

@@ -10,6 +10,13 @@
 #   URBANZERO_VENV   path to venv activate script (default ~/urbanzero_env/bin/activate)
 #   URBANZERO_REPO   path to UrbanZero repo (default ~/UrbanZero)
 #   URBANZERO_HOME   work dir for logs/checkpoints (default ~/urbanzero)
+#   URBANZERO_N_ENVS parallel CARLA envs (default 1). Each env uses
+#                    base_port + i*1000, so launch CARLA on 2000, 3000, ...
+#                    n=2 is recommended for RTX 4080 Super (safe VRAM
+#                    budget, ~1.8x throughput). n>=3 risks OOM.
+#   URBANZERO_BASE_PORT  base CARLA port (default 2000)
+#   URBANZERO_TIMESTEPS  total training steps (default 10_000_000)
+#   URBANZERO_SEED   RNG seed (default 42)
 #   URBANZERO_SKIP_PREFLIGHT  if set, skip preflight (use only when debugging)
 
 set -uo pipefail
@@ -19,12 +26,16 @@ EXPERIMENT="${URBANZERO_EXP:-shaped}"
 VENV="${URBANZERO_VENV:-$HOME/urbanzero_env/bin/activate}"
 REPO="${URBANZERO_REPO:-$HOME/UrbanZero}"
 HOME_DIR="${URBANZERO_HOME:-$HOME/urbanzero}"
+N_ENVS="${URBANZERO_N_ENVS:-1}"
+BASE_PORT="${URBANZERO_BASE_PORT:-2000}"
+TIMESTEPS="${URBANZERO_TIMESTEPS:-10000000}"
+SEED="${URBANZERO_SEED:-42}"
 CKPT_DIR="$HOME_DIR/checkpoints/$EXPERIMENT"
 LOG_DIR="$HOME_DIR/logs"
 
 mkdir -p "$CKPT_DIR" "$LOG_DIR"
 
-ACTIVATE="source '$VENV' && export PYTHONPATH=\$PYTHONPATH:'$CARLA_PYTHONAPI' && cd '$REPO'"
+ACTIVATE="source '$VENV' && export PYTHONPATH=\$PYTHONPATH:'$CARLA_PYTHONAPI' && export URBANZERO_SEED='$SEED' && cd '$REPO'"
 
 # Find checkpoint: use arg, or latest autosave/ppo/emergency.
 CKPT="${1:-$(ls -t "$CKPT_DIR"/autosave_*_steps.zip "$CKPT_DIR"/ppo_urbanzero_*_steps.zip "$CKPT_DIR"/emergency_*_steps.zip 2>/dev/null | head -1)}"
@@ -49,11 +60,25 @@ fi
 tmux kill-session -t urbanzero 2>/dev/null
 sleep 1
 
+# Pre-flight the additional CARLA ports if multi-env.
+if [ "$N_ENVS" -gt 1 ]; then
+    echo "=== Multi-env (n=$N_ENVS): verifying CARLA on ports $BASE_PORT..."
+    for i in $(seq 0 $((N_ENVS - 1))); do
+        port=$((BASE_PORT + i * 1000))
+        if ! timeout 3 bash -c ">/dev/tcp/${CARLA_HOST:-172.25.176.1}/${port}" 2>/dev/null; then
+            echo "ERROR: CARLA not reachable on port $port. Launch additional CARLA server(s):" >&2
+            echo "  On Windows: start separate CarlaUE4.exe instances with -carla-rpc-port=$port" >&2
+            exit 1
+        fi
+        echo "  CARLA on port $port reachable"
+    done
+fi
+
 # Training session.
 TS="$(date +%Y%m%d_%H%M%S)"
 tmux new-session -d -s urbanzero -x 200 -y 50
 tmux send-keys -t urbanzero:0.0 \
-  "$ACTIVATE && python3 -u agents/train.py --experiment '$EXPERIMENT' $RESUME 2>&1 | tee '$LOG_DIR/train_${TS}.log'" Enter
+  "$ACTIVATE && python3 -u agents/train.py --experiment '$EXPERIMENT' --n-envs '$N_ENVS' --base-port '$BASE_PORT' --timesteps '$TIMESTEPS' $RESUME 2>&1 | tee '$LOG_DIR/train_${TS}.log'" Enter
 
 # Spectator runs in its own session — start only if not already running.
 if ! tmux has-session -t spectator 2>/dev/null; then
