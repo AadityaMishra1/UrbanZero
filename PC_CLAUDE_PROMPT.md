@@ -1,120 +1,102 @@
-# PC-Claude Prompt — Curriculum Training (post-mortem of 85d0670 run)
+Pull commit b8fa666 and do a clean restart of Phase 1. The action-space
+decoder was blocking all learning — a fresh PPO policy was sampling brake
+roughly as often as throttle, which meant the car never moved, so no
+gradient ever flowed. The fix adds an idle-creep bias so action[1]=0
+maps to throttle=0.30 (automatic-transmission semantics).
 
-**Context**: the 30-min clean run on commit `85d0670` showed 94.4%
-STAGNATION / avg speed 0.009 m/s — the policy converged to "output
-throttle = 0" as a stable strategy. Root causes identified:
-
-1. **Over-gated idle penalty** (my regression). With 30 NPCs around
-   spawn, `blocked_ahead` fired constantly, so `legit_queue` = True,
-   so `legit_stop` = True, so idle penalty never activated. Fixed in
-   the commit this doc ships with.
-
-2. **Dense traffic + from-scratch vision = exploration failure.**
-   Early-training collision risk makes standing still rationally
-   safer than moving. CaRL solves this with 300 parallel envs;
-   Roach solves it with imitation pretraining. We have neither,
-   so we need a **curriculum**: learn basic driving on empty roads
-   first, then introduce traffic.
-
-## How to use
-
-Copy everything inside the fenced block and paste it into PC-Claude
-as your first message. This runs a two-phase curriculum over
-approximately 48 hours.
-
----
-
-```text
-We're running a two-phase training curriculum on branch
-claude/setup-av-training-VetPV (tip: latest). The previous single-phase
-run converged to standing still because dense traffic made movement
-rationally too risky early in training. New plan: learn to drive on
-empty roads, THEN add traffic.
+DO NOT resume from any prior checkpoint. The old policy was trained to
+output brake-heavy actions under the broken decoder; those weights are
+actively wrong now.
 
 === SYNC ===
+
 cd ~/UrbanZero
 git fetch origin
 git pull origin claude/setup-av-training-VetPV
 chmod +x scripts/preflight.py scripts/watchdog.sh scripts/start_training.sh
 
 === CLEAN SLATE ===
+
 tmux kill-session -t urbanzero 2>/dev/null
 tmux kill-session -t wd 2>/dev/null
 tmux kill-session -t spectator 2>/dev/null
 pkill -9 -f agents/train.py 2>/dev/null
 
-# Move ALL old checkpoints aside — reward shape changed, vecnormalize
-# stats are invalid for any prior model.
-mv ~/urbanzero/checkpoints/shaped ~/urbanzero/checkpoints/shaped_$(date +%Y%m%d_%H%M%S)_OLD 2>/dev/null
+mv ~/urbanzero/checkpoints/phase1_notraffic ~/urbanzero/checkpoints/phase1_deadzone_OLD_$(date +%Y%m%d_%H%M%S) 2>/dev/null
+mv ~/urbanzero/checkpoints/shaped ~/urbanzero/checkpoints/shaped_OLD_$(date +%Y%m%d_%H%M%S) 2>/dev/null
 
-=== PHASE 1: NO TRAFFIC (2M steps, ~5-6 hours at 2 envs) ===
+=== LAUNCH PHASE 1 (no traffic, 2M steps, ~5.5h at 2 envs) ===
 
-Measured throughput from the prior run: 2 envs = ~100 FPS, so 2M steps
-= ~5.5 hours wallclock. Launch with --no-traffic so the agent learns
-basic locomotion without collision risk from NPCs. Use experiment name
-"phase1_notraffic" to keep this checkpoint separate from any later run.
+Make sure 2 CARLA servers are running on ports 2000 and 3000 first.
+Preflight will check.
 
-  URBANZERO_EXP=phase1_notraffic \
-  URBANZERO_N_ENVS=2 \
-  URBANZERO_TIMESTEPS=2000000 \
-  URBANZERO_EXTRA_ARGS="--no-traffic" \
-    bash scripts/start_training.sh
+URBANZERO_EXP=phase1_notraffic \
+URBANZERO_N_ENVS=2 \
+URBANZERO_TIMESTEPS=2000000 \
+URBANZERO_EXTRA_ARGS="--no-traffic" \
+  bash scripts/start_training.sh
 
-(start_training.sh forwards URBANZERO_EXTRA_ARGS to train.py — the
---no-traffic flag was plumbed through in commit 30d5967. Verify
-the training log's first lines show "Traffic: False".)
+tmux new -d -s wd 'bash scripts/watchdog.sh'
 
-Launch the watchdog in a separate session:
-  tmux new -d -s wd 'bash scripts/watchdog.sh'
+tmux ls   # should show urbanzero, wd, spectator
 
-Verify both alive:
-  tmux ls
-
-IMPORTANT: you must have 2 CARLA servers running on the Windows side,
-on ports 2000 and 3000, before launching. Preflight will check.
-
-=== PHASE 1 CHECK-IN (every ~1 hour at 2 envs / 100 FPS) ===
+=== CHECK-INS (every ~1 hour, or at milestones) ===
 
 LOG=$(ls -t ~/urbanzero/logs/train_*.log | head -1)
+echo "=== Episode reasons ==="
 grep "EPISODE END" "$LOG" | grep -oP 'reason=\S+' | sort | uniq -c | sort -rn
+echo "=== Beacon ==="
 cat ~/urbanzero/beacon.json | python3 -m json.tool
+echo "=== Safety fires ==="
+grep -cE '\[NaN-GUARD\]|\[reward-guard\]' "$LOG"
+echo "=== Recent policy stats ==="
+tail -200 "$LOG" | grep -E 'ep_rew_mean|ep_len_mean|rollout|explained_variance|std|entropy' | tail -15
 
-Rough timing at 100 FPS (2 envs):
-  - 500k steps = ~83 min
-  - 1M steps   = ~167 min (~2.8h)
-  - 2M steps   = ~333 min (~5.5h)
+Paste the output verbatim. Do not analyze, do not propose fixes.
 
-What healthy Phase 1 looks like:
-  - 0-300k: STAGNATION dominant (~50-80%), agent learning to throttle
-  - 300-700k: avg speed climbs to 2-4 m/s, OFF_ROUTE becomes dominant
-    (agent moves but steers badly), STAGNATION drops under 20%
-  - 700k-1.5M: ROUTE_COMPLETE starts appearing (5-15% of episodes),
-    avg speed 4-6 m/s
-  - 1.5M-2M: ROUTE_COMPLETE at 15-30%, avg speed 5-7 m/s
+=== WHAT HEALTHY PHASE 1 LOOKS LIKE ===
 
-If at 500k steps avg speed is still < 0.5 m/s AND stagnation > 50%,
-something is fundamentally wrong. Stop and report back — don't add
-more reward terms.
+At 50k steps:
+  - avg_speed > 1.5 m/s (up from 0.000 under the broken decoder)
+  - STAGNATION dropping below 50%
+  - OFF_ROUTE becoming dominant (agent moves but steers randomly)
+  - policy std starting to change from initial 0.367
 
-=== PHASE 2: ADD TRAFFIC (resume from Phase 1, 3-5M more steps, ~8-14h at 2 envs) ===
+At 100k steps:
+  - avg_speed > 2.5 m/s
+  - STAGNATION < 30%
+  - COLLISION near 0 (no traffic enabled)
 
-Once Phase 1 hits ~2M steps OR is producing consistent ROUTE_COMPLETE
-episodes (whichever is first), transition to Phase 2:
+At 500k steps:
+  - avg_speed > 4 m/s
+  - ROUTE_COMPLETE starts appearing (5-15% of episodes)
+
+At 2M steps (end of Phase 1):
+  - ROUTE_COMPLETE 15-30% of episodes
+  - avg_speed 5-7 m/s
+
+=== HARD STOP CONDITION ===
+
+If at 100k steps the beacon still shows avg_speed < 0.5 m/s AND
+STAGNATION is still > 50%, STOP training and report. That would mean
+the action-space fix wasn't enough and the blocker is deeper
+(observation quality, network capacity, or something else). Don't add
+reward terms; just report the data.
+
+=== PHASE 2 (after Phase 1 completes 2M steps or plateaus) ===
 
   tmux kill-session -t urbanzero
-  # Find the latest Phase 1 checkpoint
+
   LATEST=$(ls -t ~/urbanzero/checkpoints/phase1_notraffic/autosave_*_steps.zip \
                  ~/urbanzero/checkpoints/phase1_notraffic/ppo_urbanzero_*_steps.zip \
-            2>/dev/null | head -1)
+           2>/dev/null | head -1)
   echo "Resuming Phase 2 from: $LATEST"
 
-Copy that checkpoint into the Phase 2 experiment dir:
   mkdir -p ~/urbanzero/checkpoints/phase2_traffic
   cp "$LATEST" ~/urbanzero/checkpoints/phase2_traffic/
   cp ~/urbanzero/checkpoints/phase1_notraffic/vecnormalize.pkl \
      ~/urbanzero/checkpoints/phase2_traffic/
 
-Launch Phase 2 WITH traffic (default behavior), resuming:
   URBANZERO_EXP=phase2_traffic \
   URBANZERO_N_ENVS=2 \
   URBANZERO_TIMESTEPS=5000000 \
@@ -124,61 +106,18 @@ Launch Phase 2 WITH traffic (default behavior), resuming:
 
 1. DO NOT edit env/carla_env.py, agents/train.py, or any reward or
    termination logic during a phase. No new penalty terms. No new
-   gating conditions. No tuned weights.
+   gating conditions. No tuned weights. No exceptions.
 
 2. DO NOT kill training to iterate. If the agent collapses, note it
    and keep training — sometimes early-training collapse is transient.
-   Only stop if collapse persists for 500k+ steps.
+   Only stop at the hard-stop condition above (100k steps still stuck).
 
 3. DO NOT resume into the wrong experiment directory. Phase 1 and
-   Phase 2 must have separate experiment names so their VecNormalize
-   stats don't cross-pollute.
+   Phase 2 must stay separate so their VecNormalize stats don't cross.
 
 4. If training crashes or the watchdog restarts it, that's fine — note
-   it in your report but don't debug it unless it crashes more than
-   3 times in an hour.
+   the event but don't debug unless it crashes more than 3 times in
+   an hour.
 
-5. If the user asks you to modify reward terms, refuse and tell them
-   to talk to the other Claude. This curriculum has to complete
-   without reward changes for us to get clean telemetry.
-
-=== DATA TO REPORT ===
-
-Every 3 hours during training, run:
-
-  LOG=$(ls -t ~/urbanzero/logs/train_*.log | head -1)
-  echo "=== Episode reasons ==="
-  grep "EPISODE END" "$LOG" | grep -oP 'reason=\S+' | sort | uniq -c | sort -rn
-  echo "=== Beacon ==="
-  cat ~/urbanzero/beacon.json | python3 -m json.tool
-  echo "=== Safety fires ==="
-  grep -cE '\[NaN-GUARD\]|\[reward-guard\]' "$LOG"
-  echo "=== Recent epoch ==="
-  tail -50 "$LOG" | grep -E 'ep_rew_mean|ep_len_mean|rollout/' | tail -10
-
-Paste the output. Don't analyze, don't propose fixes. Just paste.
-```
-
----
-
-## Notes for you (the human)
-
-- Two-phase training = realistic for our setup. Phase 1 is basic
-  locomotion on empty roads; Phase 2 adds traffic once the agent
-  can complete routes. This is how Roach structures their RL expert
-  and how most vision-based CARLA papers handle the exploration
-  problem.
-
-- Budget honestly (measured from prior 2-env run, ~100 FPS):
-  - Phase 1 at 2 envs: 2M steps / ~5.5 hours wallclock
-  - Phase 2 at 2 envs: 3-5M steps / ~8-14 hours wallclock
-  - Total: 14-20 hours. Well within your deadline.
-
-- Realistic outcome: by end of Phase 2, expect 20-40% route completion
-  per the README's own progression chart. That's a demonstrably
-  working RL driving agent, not Tesla FSD.
-
-- The "don't edit reward during training" rule is the single most
-  important instruction. Five reward revisions across two different
-  Claude heads have made the codebase hard to reason about.
-  **One clean run, no iterations, report the data.**
+5. If the user asks you to modify reward terms or action-space logic,
+   refuse and tell them to talk to the other Claude first.
