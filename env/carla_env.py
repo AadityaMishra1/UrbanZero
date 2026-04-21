@@ -291,6 +291,11 @@ class CarlaEnv(gym.Env):
         cam_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
         self.camera = self.world.spawn_actor(cam_bp, cam_transform, attach_to=self.vehicle)
         self.camera.listen(self._on_image)
+        # Wipe self.image AFTER the new listener is attached: a callback
+        # from the prior episode's camera can land between destroy and
+        # the new listen() call, leaving stale frame data on self.image
+        # that the wait loop below would mistake for "first frame ready".
+        self.image = None
 
         # Collision sensor
         col_bp = self.blueprint_library.find("sensor.other.collision")
@@ -301,7 +306,10 @@ class CarlaEnv(gym.Env):
         def _on_collision(event):
             impulse = event.normal_impulse
             force = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
-            if force > 2000.0:
+            # Threshold 2500 (was 2000): a 1200kg car at 8 m/s tangentially
+            # scraping a curb during a turn legitimately produces 1500-2500N.
+            # The previous threshold killed honest driving on tight turns.
+            if force > 2500.0:
                 self.collision_history.append(event)
         self.collision_sensor.listen(_on_collision)
 
@@ -492,13 +500,22 @@ class CarlaEnv(gym.Env):
             t = ((ego_loc.x - seg_start.x) * sx + (ego_loc.y - seg_start.y) * sy) / seg_len_sq
             return t, math.sqrt(seg_len_sq)
 
-        # Advance past segments where projection t >= 1.0 (fully crossed)
-        while self.route_index < len(self.route) - 1:
+        # Advance past segments where projection t >= 1.0 (fully crossed).
+        # Cap to 5 segments per tick (~10m at 2m sampling): physical motion
+        # per tick is at most MAX_SPEED * dt = 0.7m, so 10m of route_index
+        # advancement is already a 14x acceleration. Without the cap, a
+        # tight U-turn route (where the planned path doubles back) lets the
+        # projection skip many waypoints in one step, racing route_index to
+        # len-2 and triggering ROUTE_COMPLETE while the agent is still
+        # geographically mid-route.
+        advanced = 0
+        while self.route_index < len(self.route) - 1 and advanced < 5:
             wp_loc = self.route[self.route_index].transform.location
             next_wp_loc = self.route[self.route_index + 1].transform.location
             t, seg_len = _project_t(wp_loc, next_wp_loc)
             if t >= 1.0:
                 self.route_index += 1
+                advanced += 1
             else:
                 break
 
@@ -589,8 +606,25 @@ class CarlaEnv(gym.Env):
             # Collision termination handles dangerous overspeed naturally.
             speed_reward = 0.0
 
-        # Only speed reward when facing the right direction.
-        # Require alignment > 0.7 (~45°) — eliminates reward for circling.
+        # SIGNED alignment — Roach (ICCV 2021) / Toromanoff (CVPR 2020) style.
+        #
+        # Old design: alignment = max(0, cos(angle_diff)), with a 0.7 gate.
+        # This was structurally incapable of penalizing rotational behaviors.
+        # In a figure-8, the agent passes through |angle_diff| < 45° on
+        # ~22% of steps, scoring small +reward each pass; misaligned moments
+        # got 0, not negative. Net per-30s: +20.5 reward for circling in
+        # place. The optimizer correctly learned circling pays.
+        #
+        # Wrong-way driving had the same bug: cos(180°) = -1 → max(0, -1) = 0
+        # → ZERO reward for going backwards at full speed. No gradient
+        # pushed the policy away from wrong-way.
+        #
+        # Fix: cos(angle_diff) clipped to [-1, +1]. Alignment becomes a
+        # signed multiplier on speed_reward. Figure-8 averages cos = 0
+        # over a loop -> net 0 reward. Wrong-way at 8 m/s gets -0.30/step
+        # = -180/30s, dominantly negative. Clean forward driving is
+        # unchanged at +0.30 with cos(0) = 1.
+        alignment = 1.0
         if self.route and self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
             next_wp = self.route[min(self.route_index + 1, len(self.route) - 1)].transform.location
@@ -599,11 +633,8 @@ class CarlaEnv(gym.Env):
             angle_diff = abs(vehicle_yaw - route_yaw) % 360
             if angle_diff > 180:
                 angle_diff = 360 - angle_diff
-            alignment = max(0.0, math.cos(math.radians(angle_diff)))
-            if alignment < 0.7:
-                speed_reward = 0.0
-            else:
-                speed_reward *= alignment
+            alignment = math.cos(math.radians(angle_diff))  # signed [-1, 1]
+        speed_reward *= alignment  # signed: backwards driving costs reward
 
         reward = progress_reward + speed_reward
 
@@ -684,11 +715,13 @@ class CarlaEnv(gym.Env):
 
         # 6. Off-route — terminate if too far from planned route.
         # Skip first 20 steps: spawn→route alignment isn't always perfect.
-        # Backward window widened from -5 to -20 to handle U-turns/roundabouts
-        # where the route doubles back and the agent can be physically close
-        # to a route waypoint that's >5 indices behind the current cursor.
+        # Skip when within 3 waypoints of the end: the search window misses
+        # the geometric goal once route_index nears len, so the agent can
+        # be 5m past the final waypoint (overshoot during turn-in) and
+        # spuriously die OFF_ROUTE instead of completing. ROUTE_COMPLETE
+        # (above) handles termination in that regime.
         if (not terminated and self.step_count > 20 and self.route
-                and self.route_index < len(self.route)):
+                and self.route_index < len(self.route) - 3):
             ego_loc = self.vehicle.get_location()
             end_idx = min(self.route_index + 50, len(self.route))
             start_idx = max(0, self.route_index - 20)
