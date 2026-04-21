@@ -171,8 +171,15 @@ class CarlaEnv(gym.Env):
         # Telemetry: count how many reward-side guards trip per episode.
         self._reward_clip_hits = 0
         self._progress_clamp_hits = 0
-        # Updated whenever progress_delta > 0.5m; used by 30s "really stuck" net.
+        # 30s really-stuck net: track cumulative route_progress, not per-step
+        # delta. Updating on per-step delta > 0.5m falsely concluded the agent
+        # was "stuck" any time it drove at or below target speed
+        # (target=8.33 m/s -> 0.42m/step, BELOW 0.5m threshold), killing every
+        # clean run at exactly step ~601. Cumulative version updates the
+        # anchor whenever route_progress advances by another 1m, regardless
+        # of per-step rate.
         self._last_significant_progress_step = 0
+        self._significant_progress_anchor = 0.0
 
         # Weather randomization
         if self.enable_weather_randomization:
@@ -374,26 +381,29 @@ class CarlaEnv(gym.Env):
             truncated = True
 
         # DEBUG: log WHY every episode ends. ROUTE_COMPLETE and REALLY_STUCK
-        # already printed inline; this fills in the rest.
+        # also print inline at trigger; this is the unified summary.
         if terminated or truncated:
             speed = self._get_speed()
             rc = self._get_route_completion()
+            steps_since_prog = self.step_count - self._last_significant_progress_step
             if len(self.collision_history) > 0:
                 reason = "COLLISION"
             elif self.stagnation_counter > 200:
                 reason = f"STAGNATION (counter={self.stagnation_counter})"
+            elif rc > 0.85 or self.route_index >= len(self.route) - 2:
+                reason = "ROUTE_COMPLETE"
+            elif steps_since_prog > 600:
+                reason = "REALLY_STUCK"
             elif (self.step_count > 120
                   and len(self._progress_window) >= 120
                   and sum(self._progress_window) < 8.0):
                 reason = "CIRCLING"
             elif self.step_count >= self.max_episode_steps:
                 reason = "MAX_STEPS"
-            elif rc > 0.85:
-                reason = "ROUTE_COMPLETE"
             else:
                 reason = "OFF_ROUTE"
-            # Skip duplicate print for reasons that print inline at trigger time.
-            if reason not in ("ROUTE_COMPLETE",):
+            # Skip duplicate print for reasons that print inline at trigger.
+            if reason not in ("ROUTE_COMPLETE", "REALLY_STUCK"):
                 print(f"[EPISODE END] reason={reason} steps={self.step_count} "
                       f"({self.step_count*0.05:.1f}s) speed={speed:.1f}m/s "
                       f"route={rc*100:.1f}% stag={self.stagnation_counter} "
@@ -608,14 +618,30 @@ class CarlaEnv(gym.Env):
                                              carla.TrafficLightState.Yellow):
                     at_red_light = True
 
-        # Is the car blocked by a vehicle in its lane?  If so, don't
-        # punish it for not making progress (gates the circling check
-        # AND prevents stagnation false-positives in queued traffic).
+        # Is the car blocked by a vehicle in its lane?
         blocked_ahead = self._is_blocked_by_vehicle()
 
-        # (a) Stagnation counter — catches stopped/crawling cars
+        # Route alignment: 1.0 = facing along route, 0 = perpendicular,
+        # <0 = backwards. Used to disambiguate "queued behind a slow bus"
+        # (aligned + blocked = legit) from "circling in figure-8 in dense
+        # traffic" (not aligned + blocked = NOT a legit excuse to skip
+        # termination). Without this gate, any circling agent that bumps
+        # into traffic avoids both stagnation AND circling kills.
+        route_alignment = 1.0
+        if self.route and self.route_index < len(self.route) - 1:
+            wp_a = self.route[self.route_index].transform.location
+            wp_b = self.route[self.route_index + 1].transform.location
+            r_yaw = math.degrees(math.atan2(wp_b.y - wp_a.y, wp_b.x - wp_a.x))
+            v_yaw = self.vehicle.get_transform().rotation.yaw
+            d = abs(v_yaw - r_yaw) % 360
+            if d > 180:
+                d = 360 - d
+            route_alignment = math.cos(math.radians(d))
+        legit_queue = blocked_ahead and route_alignment > 0.5
+
+        # (a) Stagnation counter — catches stopped/crawling cars.
         no_progress = progress_delta < 0.01
-        if (speed < 0.5 or no_progress) and not at_red_light and not blocked_ahead:
+        if (speed < 0.5 or no_progress) and not at_red_light and not legit_queue:
             self.stagnation_counter += 1
         else:
             self.stagnation_counter = max(0, self.stagnation_counter - 1)
@@ -627,7 +653,10 @@ class CarlaEnv(gym.Env):
         self._progress_window.append(progress_delta)
         if len(self._progress_window) > 120:
             self._progress_window.pop(0)
-        if progress_delta > 0.5:
+        # Cumulative anchor — updates whenever route_progress advances by 1m+
+        # (i.e. any meaningful forward motion), independent of per-step speed.
+        if self.route_progress - self._significant_progress_anchor > 1.0:
+            self._significant_progress_anchor = self.route_progress
             self._last_significant_progress_step = self.step_count
 
         # 4. Collision — small explicit penalty + episode termination.
@@ -672,14 +701,14 @@ class CarlaEnv(gym.Env):
                 terminated = True
 
         # 7. Rolling progress check — catches circling at speed.
-        # Now 120 steps (6s), 8m threshold (~1.3 m/s avg). Skip when at red
-        # light OR blocked by vehicle ahead — both legitimate reasons to slow.
+        # 120 steps (6s), 8m threshold (~1.3 m/s avg). Skip when at red light
+        # or in a legit queue (blocked AND aligned with route — see above).
         if (not terminated
                 and self.step_count > 120
                 and len(self._progress_window) >= 120
                 and sum(self._progress_window) < 8.0
                 and not at_red_light
-                and not blocked_ahead):
+                and not legit_queue):
             terminated = True
             reward = -5.0
 
