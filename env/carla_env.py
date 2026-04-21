@@ -346,21 +346,46 @@ class CarlaEnv(gym.Env):
     def step(self, action):
         self.step_count += 1
 
-        # Apply action (with deadzone to prevent throttle/brake oscillation)
         steer = float(np.clip(action[0], -1.0, 1.0))
         throttle_brake = float(np.clip(action[1], -1.0, 1.0))
-        if throttle_brake > 0.05:
-            self.vehicle.apply_control(carla.VehicleControl(
-                throttle=throttle_brake, steer=steer, brake=0.0
-            ))
-        elif throttle_brake < -0.05:
-            self.vehicle.apply_control(carla.VehicleControl(
-                throttle=0.0, steer=steer, brake=-throttle_brake
-            ))
-        else:
-            self.vehicle.apply_control(carla.VehicleControl(
-                throttle=0.0, steer=steer, brake=0.0
-            ))
+
+        # Idle-creep action bias — the single most important fix after
+        # PC-Claude's 95k-step diagnostic (commit 871451e).
+        #
+        # Problem the fix addresses: fresh PPO policy samples throttle_brake
+        # from N(mean=0, std=0.367). With the old decoder:
+        #   P(brake applied)    ≈ 45% of samples (action[1] < -0.05)
+        #   P(deadzone, nothing) ≈ 11%
+        #   P(throttle applied) ≈ 45%
+        # Brakes are a strong anti-motion force; they win when alternating
+        # with weak throttle samples. Result: the car never moves, so PPO
+        # never observes "moving" states, so no useful policy gradient ever
+        # flows. The 95k-step run was stuck at avg speed 0.000 m/s with
+        # std flat at its initial value — dead-zero gradient.
+        #
+        # Fix: shift the neutral point so action[1] = 0 (policy init mean)
+        # produces a throttle of 0.3 — like an automatic transmission's
+        # idle creep. Brake only fires when action[1] < -0.3.
+        #
+        # New mapping:
+        #   action[1] =  0.0   → throttle=0.30, brake=0.00  (idle creep)
+        #   action[1] = -0.3   → throttle=0.00, brake=0.00  (coast)
+        #   action[1] = -1.0   → throttle=0.00, brake=0.70  (full brake)
+        #   action[1] =  0.7   → throttle=1.00, brake=0.00  (full throttle)
+        #
+        # With new mapping, P(throttle fires | policy init) ≈ 79%,
+        # P(brake fires) ≈ 21%. Strong motion prior.
+        #
+        # Justification: Silver et al. 2018 "Residual Policy Learning" (fixed
+        # baseline + learned residual); Andrychowicz et al. 2020 "What Matters
+        # in On-Policy RL" ICLR (action parameterization among top-5 impactful
+        # choices). Models real-car automatic-transmission idle semantics.
+        shifted = throttle_brake + 0.3
+        throttle = max(0.0, min(1.0, shifted))
+        brake = max(0.0, min(1.0, -shifted))
+        self.vehicle.apply_control(carla.VehicleControl(
+            throttle=throttle, steer=steer, brake=brake
+        ))
 
         # Defensive tick: a single transient server hiccup shouldn't kill the
         # whole rollout. One reconnect+retry, then surface the failure.
