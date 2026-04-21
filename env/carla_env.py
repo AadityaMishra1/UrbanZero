@@ -136,9 +136,6 @@ class CarlaEnv(gym.Env):
         self.total_route_length = 0.0
         self.route_progress = 0.0  # cumulative meters traveled along route
         self.stagnation_counter = 0
-        # Rolling progress window: track progress over last 100 steps (5 sec)
-        # to detect circling at speed (stagnation counter misses this)
-        self._progress_window = []
 
     def reset(self, seed=None, options=None):
         # Retry up to 3 times: black-image timeouts, no-spawn-found, etc.
@@ -167,7 +164,6 @@ class CarlaEnv(gym.Env):
         self.route_progress = 0.0
         self._prev_seg_t = 0.0
         self._prev_seg_idx = 0
-        self._progress_window = []
         # Telemetry: count how many reward-side guards trip per episode.
         self._reward_clip_hits = 0
         self._progress_clamp_hits = 0
@@ -402,10 +398,6 @@ class CarlaEnv(gym.Env):
                 reason = "ROUTE_COMPLETE"
             elif steps_since_prog > 600:
                 reason = "REALLY_STUCK"
-            elif (self.step_count > 120
-                  and len(self._progress_window) >= 120
-                  and sum(self._progress_window) < 8.0):
-                reason = "CIRCLING"
             elif self.step_count >= self.max_episode_steps:
                 reason = "MAX_STEPS"
             else:
@@ -573,57 +565,48 @@ class CarlaEnv(gym.Env):
         return min(self.route_progress / self.total_route_length, 1.0)
 
     # ------------------------------------------------------------------
-    # REWARD FUNCTION — CaRL-style (route completion only)
+    # REWARD FUNCTION — Roach-style dense shaping for single-env training.
     #
-    # Based on CaRL (CoRL 2025): the state of the art uses route
-    # completion as the ONLY positive reward.  No speed reward, no
-    # heading reward, no lane centering.  Speed is emergent from
-    # wanting to complete more route.  Collision = episode termination,
-    # and the lost future reward IS the punishment.
+    # Per-step shaping (each clipped/bounded so none can dominate):
+    #   r_progress  = 2.0 * progress_delta              [Roach §3.3, CaRL]
+    #   r_speed     = 0.3 * (speed/TARGET) * cos(angle) [Roach signed]
+    #   r_lateral   = -0.1 * min(|offset|/2.0, 1.0)     [Roach §3.3]
+    #   r_smooth    = -0.05 * ||a_t - a_{t-1}||^2       [CAPS, ICRA 2021]
+    # Terminals:
+    #   r_collision        = -5.0                       [Roach, Toromanoff]
+    #   r_route_complete   = +10.0 if parked at goal    [novel: must stop]
+    #
+    # Design choices: pure CaRL (progress-only) needs 300+ parallel envs
+    # (Jaeger et al., CoRL 2025). With 1 env we use Roach's denser
+    # additive shaping. Signed alignment (instead of a gate) is what
+    # makes circling reward-negative and wrong-way reward-negative —
+    # see commit 0bc0dc5 for the math.
     # ------------------------------------------------------------------
 
     def _compute_reward(self, action):
         speed = self._get_speed()
 
-        # 1. Route progress — primary reward signal.
-        # Every meter of progress along the planned route = +2.0 reward.
-        # Scaled up from 1.0 so the signal is strong enough for single-env training.
+        # Clipped action (matches what was actually applied in step()).
+        steer = float(np.clip(action[0], -1.0, 1.0))
+        throttle_brake = float(np.clip(action[1], -1.0, 1.0))
+
+        # 1. Route progress — primary positive signal (CaRL / Roach §3.3).
         progress_delta = self._advance_route_index()
         self.route_progress += progress_delta
         progress_reward = progress_delta * 2.0
 
-        # 2. Speed reward — necessary bootstrap for single-env training.
-        # Pure progress-only (CaRL) needs massive parallelism to work.
-        # With 1 env, the agent crawls at 0.7 m/s and gets near-zero
-        # progress reward per step, so the value function can't learn.
-        # This gives a clear signal: going faster toward target = good.
+        # 2. Speed reward, signed by route alignment.
+        # Triangle-shaped peak at TARGET_SPEED, falls to 0 at MAX_SPEED.
         if speed < TARGET_SPEED:
             speed_reward = 0.3 * (speed / TARGET_SPEED)
         elif speed < MAX_SPEED:
             speed_reward = 0.3 * (1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
         else:
-            # Over MAX_SPEED: no reward, no penalty. Don't divide-by-zero.
-            # Collision termination handles dangerous overspeed naturally.
-            speed_reward = 0.0
+            speed_reward = 0.0  # over-speed: no reward, no divide-by-zero
 
-        # SIGNED alignment — Roach (ICCV 2021) / Toromanoff (CVPR 2020) style.
-        #
-        # Old design: alignment = max(0, cos(angle_diff)), with a 0.7 gate.
-        # This was structurally incapable of penalizing rotational behaviors.
-        # In a figure-8, the agent passes through |angle_diff| < 45° on
-        # ~22% of steps, scoring small +reward each pass; misaligned moments
-        # got 0, not negative. Net per-30s: +20.5 reward for circling in
-        # place. The optimizer correctly learned circling pays.
-        #
-        # Wrong-way driving had the same bug: cos(180°) = -1 → max(0, -1) = 0
-        # → ZERO reward for going backwards at full speed. No gradient
-        # pushed the policy away from wrong-way.
-        #
-        # Fix: cos(angle_diff) clipped to [-1, +1]. Alignment becomes a
-        # signed multiplier on speed_reward. Figure-8 averages cos = 0
-        # over a loop -> net 0 reward. Wrong-way at 8 m/s gets -0.30/step
-        # = -180/30s, dominantly negative. Clean forward driving is
-        # unchanged at +0.30 with cos(0) = 1.
+        # SIGNED alignment — cos(angle_diff) in [-1, +1]. Wrong-way and
+        # perpendicular driving give NEGATIVE r_speed. Figure-8 averages
+        # to 0 over a loop. Clean forward driving unchanged.
         alignment = 1.0
         if self.route and self.route_index < len(self.route) - 1:
             wp_loc = self.route[self.route_index].transform.location
@@ -633,10 +616,35 @@ class CarlaEnv(gym.Env):
             angle_diff = abs(vehicle_yaw - route_yaw) % 360
             if angle_diff > 180:
                 angle_diff = 360 - angle_diff
-            alignment = math.cos(math.radians(angle_diff))  # signed [-1, 1]
-        speed_reward *= alignment  # signed: backwards driving costs reward
+            alignment = math.cos(math.radians(angle_diff))
+        speed_reward *= alignment
 
-        reward = progress_reward + speed_reward
+        # 3. Lateral deviation penalty (Roach §3.3, Toromanoff CVPR 2020).
+        # Continuous per-step penalty for drifting from lane center.
+        # Capped at 2m so a single-lane swerve costs the full 0.1 but a
+        # routine lane change can recover quickly. Without this term,
+        # the agent had no incentive to stay in lane between waypoints.
+        lateral_penalty = 0.0
+        if self.vehicle is not None:
+            ego_loc_l = self.vehicle.get_location()
+            wp_l = self.map.get_waypoint(ego_loc_l, project_to_road=True,
+                                         lane_type=carla.LaneType.Driving)
+            if wp_l is not None:
+                wp_yaw_rad = math.radians(wp_l.transform.rotation.yaw)
+                dx_l = ego_loc_l.x - wp_l.transform.location.x
+                dy_l = ego_loc_l.y - wp_l.transform.location.y
+                signed_offset = math.cos(wp_yaw_rad) * dy_l - math.sin(wp_yaw_rad) * dx_l
+                lateral_penalty = -0.1 * min(abs(signed_offset) / 2.0, 1.0)
+
+        # 4. Action smoothness (CAPS — Mysore et al., ICRA 2021).
+        # Penalize sudden control changes to reduce steering oscillation
+        # and the "shaky camera" the policy was producing. Quadratic so
+        # tiny jitter is nearly free; large reversals are expensive.
+        d_steer = steer - float(self.prev_action[0])
+        d_throttle = throttle_brake - float(self.prev_action[1])
+        smoothness_penalty = -0.05 * (d_steer * d_steer + d_throttle * d_throttle)
+
+        reward = progress_reward + speed_reward + lateral_penalty + smoothness_penalty
 
         # 3. Blocked/wrong-way detection.
         # Two mechanisms: (a) stagnation counter for stopped cars,
@@ -677,15 +685,10 @@ class CarlaEnv(gym.Env):
         else:
             self.stagnation_counter = max(0, self.stagnation_counter - 1)
 
-        # (b) Rolling progress window — catches circling at speed.
-        # 120-step window (6 sec), 8m threshold. Looser than before to
-        # avoid false-positives in dense traffic. The 30s "really stuck"
-        # net below catches the cases this window now misses.
-        self._progress_window.append(progress_delta)
-        if len(self._progress_window) > 120:
-            self._progress_window.pop(0)
-        # Cumulative anchor — updates whenever route_progress advances by 1m+
-        # (i.e. any meaningful forward motion), independent of per-step speed.
+        # Cumulative progress anchor for the REALLY_STUCK safety net below.
+        # Updates whenever route_progress advances by another meter — any
+        # meaningful forward motion keeps the marker fresh, regardless
+        # of per-step speed.
         if self.route_progress - self._significant_progress_anchor > 1.0:
             self._significant_progress_anchor = self.route_progress
             self._last_significant_progress_step = self.step_count
@@ -696,22 +699,25 @@ class CarlaEnv(gym.Env):
             reward = -5.0
             terminated = True
 
-        # 5. Route completion — one-shot terminal bonus when ego reaches goal.
-        # Without this, a successfully-completed route just runs to max_steps,
-        # which the user perceives as "ends abruptly without finishing".
-        # Bonus = +10.0 (= clip_reward cap, so VecNormalize can't amplify it).
-        # Gated on rc > 0.85 so the agent can't farm by spawning near the goal.
+        # 5. Route completion — must REACH the goal AND PARK there.
+        # Real driving means stopping at the destination, not just flying
+        # past at speed. Speed gate (<2 m/s) forces the agent to actually
+        # decelerate and stop near the goal to claim the +10 bonus.
+        # If the agent overshoots at speed, no bonus — episode continues
+        # until off-route or max-steps fires naturally.
         if not terminated and self.route and len(self.route) >= 2:
             final_wp = self.route[-1].transform.location
             ego_loc_g = self.vehicle.get_location()
             dist_to_goal = ego_loc_g.distance(final_wp)
             rc = self._get_route_completion()
-            if (dist_to_goal < 5.0 and rc > 0.85) or self.route_index >= len(self.route) - 2:
+            at_goal = (dist_to_goal < 5.0 and rc > 0.85) or \
+                      self.route_index >= len(self.route) - 2
+            if at_goal and speed < 2.0:
                 reward = 10.0
                 terminated = True
                 print(f"[EPISODE END] reason=ROUTE_COMPLETE "
                       f"dist={dist_to_goal:.1f}m rc={rc:.2%} "
-                      f"step={self.step_count}")
+                      f"speed={speed:.2f}m/s step={self.step_count}")
 
         # 6. Off-route — terminate if too far from planned route.
         # Skip first 20 steps: spawn→route alignment isn't always perfect.
@@ -733,22 +739,11 @@ class CarlaEnv(gym.Env):
                 reward = -5.0
                 terminated = True
 
-        # 7. Rolling progress check — catches circling at speed.
-        # 120 steps (6s), 8m threshold (~1.3 m/s avg). Skip when at red light
-        # or in a legit queue (blocked AND aligned with route — see above).
-        if (not terminated
-                and self.step_count > 120
-                and len(self._progress_window) >= 120
-                and sum(self._progress_window) < 8.0
-                and not at_red_light
-                and not legit_queue):
-            terminated = True
-            reward = -5.0
-
-        # 8. "Really stuck" safety net — 30s without ANY meaningful progress.
-        # Independent of red-light/blocked gating: even legitimate red lights
-        # cycle in <30s; if you've gone 30s with no >0.5m progress event you
-        # are stuck and waiting won't unstick you.
+        # 7. Really-stuck safety net — 30s without 1m of route progress.
+        # Kept as a hard backstop for genuinely-wedged states (lodged on
+        # a curb, deadlocked against a wall, etc.). With the new reward
+        # this should fire rarely; if it dominates the EPISODE END
+        # distribution something else is wrong.
         if (not terminated
                 and self.step_count - self._last_significant_progress_step > 600):
             terminated = True

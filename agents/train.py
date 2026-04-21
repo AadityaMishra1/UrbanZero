@@ -99,7 +99,9 @@ def make_env(rank, base_port, enable_traffic, enable_weather):
             port=port,
             enable_traffic=enable_traffic,
             enable_weather_randomization=enable_weather,
-            max_episode_steps=2000,       # 100 seconds at 20Hz
+            max_episode_steps=3000,       # 150 seconds at 20Hz: enough room
+                                          # for slow early agents to complete
+                                          # 200-800m routes without timing out
             num_traffic_vehicles=30,
             num_pedestrians=10,
         )

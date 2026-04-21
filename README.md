@@ -217,18 +217,34 @@ The v2 rewrite fixes all of these. The agent now receives a planned route, gets 
 
 ### Reward Function
 
-The reward follows CaRL's principle of route progress as the primary signal:
+Roach-style dense shaping (per-step) plus terminal events. Single-env
+training, so we use Roach's denser shaping rather than CaRL's
+progress-only reward (which assumes 300+ parallel envs).
 
-| Component | Weight | Description |
-|-----------|--------|-------------|
-| **Route progress** | 1.0 per meter | Primary signal — meters advanced along planned route |
-| **Speed reward** | 0.2 | Encourages target speed (~30 km/h), penalizes speeding |
-| **Heading alignment** | 0.1 | Bonus for facing the road direction |
-| **Lane centering** | -0.2 | Penalty proportional to distance from lane center |
-| **Action smoothness** | -0.05 | CAPS-style penalty on steering/throttle delta |
-| **Stagnation** | -0.3 | Penalty after 2+ seconds of zero speed |
-| **Collision** | -10.0 | Terminal penalty, episode ends |
-| **Off-route** | -5.0 | Terminal if >30m from route |
+**Per-step shaping (each clipped/bounded so none can dominate):**
+
+| Component | Coefficient | Description | Reference |
+|-----------|-------------|-------------|-----------|
+| Route progress  | +2.0 × Δm | Primary positive signal; meters along planned route, clamped to [0, 1.5m]/step. | CaRL §3.1; Roach §3.3 |
+| Speed × alignment | ±0.30 max | `0.3 × min(speed,TARGET)/TARGET × cos(angle_diff)`. **Signed** alignment in [-1, +1] makes circling reward-zero and wrong-way reward-negative. | Roach §3.3; Toromanoff CVPR 2020 |
+| Lateral deviation | -0.1 max | `-0.1 × min(\|lane_offset\|/2.0, 1.0)`. Continuous penalty for drifting from lane center. | Roach §3.3; Toromanoff CVPR 2020 |
+| Action smoothness | -0.05 max | `-0.05 × (Δsteer² + Δthrottle²)`. Reduces steering oscillation. | CAPS, ICRA 2021 |
+
+**Terminal events:**
+
+| Component | Reward | Trigger |
+|-----------|--------|---------|
+| Collision         | -5.0 | Impulse > 2500N |
+| Off-route         | -5.0 | >15m from any route waypoint in window [-20, +50], gated off near goal |
+| Route complete    | +10.0 | Within 5m of final waypoint AND speed < 2 m/s — must come to a stop ("park") |
+| Really stuck      | -5.0 | Safety net: 30s without 1m of route progress |
+| Stagnation        | -- | Truncate after 200 steps slow/no-progress (gated on red light + legit queue) |
+| Max steps         | -- | Truncate at 3000 steps (150s) |
+
+The signed-alignment design is the structural fix for the failure mode
+where the previous reward (`alignment = max(0, cos(θ))` + 0.7 gate)
+inadvertently paid the agent +20.5 reward per 30s of figure-8 circling
+in place. See commit `0bc0dc5` for the full math.
 
 ### CNN Architecture
 
