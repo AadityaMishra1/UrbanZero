@@ -1,9 +1,15 @@
 # PC-Side Claude — v2 Smoke Test Prompt
 
-**Date written:** 2026-04-22
+**Date written:** 2026-04-22 (revised after first-deploy bug fixes)
 **Branch:** `claude/setup-av-training-VetPV`
-**Tip commit:** `2f9fe00` (infra: watchdog seed-rand, preflight multi-port, BC-phase auto-resume guard)
+**Tip commit:** `79374e5` (fix: post-deploy audit — 5 additional bugs the first smoke test would hit)
 **Purpose:** 10-minute smoke test of a full reward/policy/obs/infra rewrite before committing to a long training run. Goal is to verify the new code boots, gets 4 CARLA envs running, populates the beacon, and does not fire any reward/NaN guards.
+
+**Revision note:** The first attempt at this smoke test crashed on launch
+(GitHub issue #2 — ENT_COEF_START undefined). A second audit found 4 more
+bugs that would have surfaced within the 10-minute window. Tip `79374e5`
+includes the fix for issue #2 plus all four other fixes. Verify you pull
+the latest — do NOT run against any commit before `79374e5`.
 
 ---
 
@@ -58,14 +64,21 @@ Pull:
   git pull
   git log --oneline -6
 
-Verify the top 5 commits match (order is newest first):
+Verify the top 8 commits match (order is newest first — includes the
+post-audit fix pack):
+
+  79374e5 fix: post-deploy audit — 5 additional bugs the first smoke test would hit
+  8d86025 docs: include explicit Windows CarlaUE4.exe launch commands in smoke prompt
+  c46d3dc docs: paste-ready PC-side Claude smoke-test prompt for v2 stack
   2f9fe00 infra: watchdog seed-rand, preflight multi-port, BC-phase auto-resume guard
   0612756 beacon: add exploration/KL/termination_reason telemetry
   3e8845c train: ent_coef 0.02→0.01 anneal, RollingBest ckpt, PPO-default hypers
   800fb4d policy: soft upper log_std bound only (std<=1.0), no lower floor
   a0ac534 env: CaRL-minimal reward, 10-dim state, termination_reason telemetry
 
-If any SHA differs, STOP and ask the user — the remote Claude may have pushed more.
+If `79374e5` (the fix-pack) is NOT the current HEAD, STOP and pull again —
+running any earlier tip will crash on ENT_COEF_START within seconds of
+launch (that's GitHub issue #2).
 
 Make scripts executable:
   chmod +x scripts/preflight.py scripts/watchdog.sh scripts/start_training.sh
