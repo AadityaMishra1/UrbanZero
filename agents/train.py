@@ -72,6 +72,85 @@ class WallClockCheckpointCallback(BaseCallback):
         return True
 
 
+class EntCoefAnnealCallback(BaseCallback):
+    """Linearly anneal PPO.ent_coef from start_value to floor_value over
+    anneal_steps env-steps, then hold at floor.
+
+    Cite: Andrychowicz et al. 2021 "What Matters in On-Policy RL" §4.5 —
+    entropy coefficient is one of the top-5 impactful choices for continuous
+    control. Schedule matters: constant-too-low collapses exploration early
+    (the 7M run); constant-too-high caps asymptotic performance; linear decay
+    with a nonzero floor balances both. Rajeswaran et al. 2017 §3 warns
+    specifically against annealing ent_coef to zero when fine-tuning from
+    imitation — the policy decays back toward random.
+    """
+
+    def __init__(self, start_value, floor_value, anneal_steps, verbose=0):
+        super().__init__(verbose)
+        self.start_value = float(start_value)
+        self.floor_value = float(floor_value)
+        self.anneal_steps = int(anneal_steps)
+        self._last_logged_at = -1
+
+    def _on_step(self) -> bool:
+        t = self.num_timesteps
+        frac = min(1.0, max(0.0, t / self.anneal_steps))
+        new_coef = self.start_value + frac * (self.floor_value - self.start_value)
+        self.model.ent_coef = new_coef
+        if self.verbose and (t - self._last_logged_at) >= 100_000:
+            print(f"[ent_coef_sched] t={t} ent_coef={new_coef:.4f}")
+            self._last_logged_at = t
+        return True
+
+
+class RollingBestCallback(BaseCallback):
+    """Save `best_by_rc.zip` + `best_vecnormalize.pkl` whenever rolling
+    route_completion exceeds prior max.
+
+    Addresses Agent-4 infra finding: the 7M run peaked at 7.99% RC at Phase
+    2 step 1.14M and regressed to 5.95% by the end — we would have shipped
+    the regressed model. This callback retains the peak independent of the
+    final checkpoint.
+
+    Uses a rolling-window deque matching BeaconCallback's sizing so we
+    don't ship based on a single lucky episode.
+    """
+
+    def __init__(self, save_path, window=50, min_episodes=20, verbose=0):
+        super().__init__(verbose)
+        self.save_path = save_path
+        self.window = window
+        self.min_episodes = min_episodes
+        self.best_rc = 0.0
+        from collections import deque
+        self._ep_rcs = deque(maxlen=window)
+
+    def _on_step(self) -> bool:
+        dones = self.locals.get("dones")
+        infos = self.locals.get("infos") or []
+        if dones is None:
+            return True
+        for i, done in enumerate(dones):
+            if done and i < len(infos):
+                self._ep_rcs.append(float(infos[i].get("route_completion", 0.0)))
+        if len(self._ep_rcs) < self.min_episodes:
+            return True
+        rolling_rc = sum(self._ep_rcs) / len(self._ep_rcs)
+        if rolling_rc > self.best_rc:
+            self.best_rc = rolling_rc
+            os.makedirs(self.save_path, exist_ok=True)
+            path = os.path.join(self.save_path, "best_by_rc")
+            self.model.save(path)
+            if hasattr(self.training_env, "save"):
+                self.training_env.save(
+                    os.path.join(self.save_path, "best_vecnormalize.pkl")
+                )
+            if self.verbose:
+                print(f"\n[rolling-best] new best rolling RC = {rolling_rc:.4f} "
+                      f"@ t={self.num_timesteps}, saved to {path}.zip")
+        return True
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="UrbanZero PPO Training")
     parser.add_argument("--n-envs", type=int, default=1,
@@ -217,11 +296,33 @@ def main():
         write_seconds=30,
         verbose=1,
     )
-    callbacks = CallbackList([checkpoint_cb, metrics_cb, wallclock_cb, beacon_cb])
+    # Entropy coefficient anneal: 0.02 -> 0.01 (floor) over 10M steps.
+    ent_coef_cb = EntCoefAnnealCallback(
+        start_value=ENT_COEF_START,
+        floor_value=ENT_COEF_FLOOR,
+        anneal_steps=10_000_000,
+        verbose=1,
+    )
+    # Rolling-best: save the model whenever rolling route_completion hits
+    # a new high. Final eval / demo runs from best_by_rc.zip, not from the
+    # last autosave.
+    rolling_best_cb = RollingBestCallback(
+        save_path=CKPT_DIR, window=50, min_episodes=20, verbose=1,
+    )
+    callbacks = CallbackList([
+        checkpoint_cb, metrics_cb, wallclock_cb, beacon_cb,
+        ent_coef_cb, rolling_best_cb,
+    ])
 
-    # PPO with custom CNN extractor
+    # PPO with custom CNN extractor.
+    # log_std_init = -0.5 gives std ~= 0.6 at init — Andrychowicz et al. 2021
+    # "What Matters in On-Policy RL" (ICLR) found the 0.5-0.7 std range
+    # is where PPO's exploration-vs-exploitation works for continuous control
+    # from scratch. Prior -1.0 combined with the [-2, -0.7] clamp capped
+    # std at 0.5 and drove it to the lower floor (0.14) over 7M steps.
+    # New ClampedStdPolicy only caps from above (std <= 1.0).
     policy_kwargs = dict(
-        log_std_init=-1.0,
+        log_std_init=-0.5,
         features_extractor_class=DrivingCNN,
         features_extractor_kwargs=dict(features_dim=256),
         net_arch=dict(pi=[256, 128], vf=[256, 128]),
@@ -230,6 +331,16 @@ def main():
     # Scale batch parameters with number of envs
     n_steps = 512 if args.n_envs <= 2 else 256
     batch_size = 64 * args.n_envs  # scale with envs
+
+    # Entropy coefficient schedule: start 0.02, anneal to 0.01 as a FLOOR.
+    # Andrychowicz 2021 benchmarks 0.003-0.03 as the viable band for
+    # continuous control from scratch; 0.001 (prior run) is below that
+    # and caused the documented entropy collapse (std: 0.367 -> 0.230,
+    # entropy_loss: -0.831 -> +0.115). The 0.01 floor (not 0) is critical
+    # per the same paper — dropping ent_coef to 0 late in training is the
+    # Rajeswaran et al. 2017 collapse-trigger we're avoiding.
+    ENT_COEF_START = 0.02
+    ENT_COEF_FLOOR = 0.01
 
     if args.resume:
         print(f"Resuming from: {args.resume}")
@@ -240,9 +351,9 @@ def main():
             # Override checkpoint's saved hyperparameters with current values.
             # Without this, PPO.load() silently uses the old LR/epochs from the
             # checkpoint, ignoring the tuned values above.
-            learning_rate=5e-5,
-            n_epochs=2,
-            ent_coef=0.001,
+            learning_rate=3e-4,
+            n_epochs=4,
+            ent_coef=ENT_COEF_START,
             clip_range=0.2,
             max_grad_norm=0.5,
         )
@@ -252,13 +363,16 @@ def main():
             env,
             verbose=1,
             tensorboard_log=LOG_DIR,
-            learning_rate=5e-5,             # reduced from 1e-4: stabilize KL/clip
-            ent_coef=0.001,             # minimal — clamp prevents collapse
-            vf_coef=0.5,               # value function loss weight
+            learning_rate=3e-4,         # Schulman et al. 2017 PPO default;
+                                        # prior 5e-5 was a post-hoc stabilizer
+                                        # for a broken reward, no longer needed
+            ent_coef=ENT_COEF_START,    # initialized high, annealed by callback
+            vf_coef=0.5,                # value function loss weight
             max_grad_norm=0.5,          # gradient clipping
             n_steps=n_steps,            # rollout length per env
             batch_size=batch_size,      # mini-batch size
-            n_epochs=2,                # reduced from 3: fewer reuses of same data
+            n_epochs=4,                 # PPO default; fewer epochs meant
+                                        # less gradient per rollout
             gamma=0.99,                 # discount factor
             gae_lambda=0.95,            # GAE lambda
             clip_range=0.2,             # standard PPO clip range
