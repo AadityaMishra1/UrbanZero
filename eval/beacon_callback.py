@@ -33,6 +33,14 @@ class BeaconCallback(BaseCallback):
         self._ep_rcs = deque(maxlen=rolling_window)
         self._ep_collisions = deque(maxlen=rolling_window)
         self._ep_speeds = deque(maxlen=rolling_window)
+        # Termination-reason tally over the rolling window. Counts finalize
+        # when their episode pops out of the equivalent-size deque above.
+        # Agent-4 audit: absence of this telemetry was the "20-hour hide"
+        # failure mode — late regressions (rising collisions, circling) are
+        # averaged into the rolling return and don't surface until it's too
+        # late to intervene. Per-reason counts surface them immediately.
+        self._ep_reasons = deque(maxlen=rolling_window)
+        self._cumulative_reward_clip_hits = 0
         self._ep_count = 0
         self._cur_returns = None
         self._cur_lens = None
@@ -63,6 +71,13 @@ class BeaconCallback(BaseCallback):
                     if s:
                         self._cur_speeds[i] = (self._cur_speeds[i] * 0.9
                                                + float(s) * 0.1)
+                    # Reward-clip hits: env increments per-episode counter.
+                    # We accumulate across all episodes (cumulative, not rolling)
+                    # because any non-zero rate means the reward function is
+                    # producing values outside [-100, 100] which is a bug signal.
+                    clip_hits = infos[i].get("reward_clip_hits", 0)
+                    if clip_hits:
+                        self._cumulative_reward_clip_hits += int(clip_hits)
                 if dones[i]:
                     self._ep_returns.append(self._cur_returns[i])
                     self._ep_lens.append(self._cur_lens[i])
@@ -70,6 +85,7 @@ class BeaconCallback(BaseCallback):
                     if i < len(infos):
                         self._ep_rcs.append(float(infos[i].get("route_completion", 0.0)))
                         self._ep_collisions.append(int(infos[i].get("collisions", 0) > 0))
+                        self._ep_reasons.append(str(infos[i].get("termination_reason") or "UNKNOWN"))
                     self._ep_count += 1
                     self._cur_returns[i] = 0.0
                     self._cur_lens[i] = 0
@@ -101,6 +117,41 @@ class BeaconCallback(BaseCallback):
         candidates.sort(reverse=True)
         return candidates[0][1], candidates[0][0]
 
+    def _policy_std(self):
+        """Current mean std of the Gaussian policy, or None if unavailable.
+
+        Reading log_std directly is the cleanest signal for exploration
+        health. If it drifts to a single very-low value, entropy has
+        collapsed; if it hits the LOG_STD_MAX clamp (0.0 in ClampedStdPolicy),
+        the policy is under too much entropy pressure from ent_coef.
+        """
+        try:
+            import torch
+            policy = self.model.policy
+            if hasattr(policy, "log_std"):
+                with torch.no_grad():
+                    return float(torch.exp(policy.log_std).mean().item())
+        except Exception:
+            pass
+        return None
+
+    def _termination_reason_counts(self):
+        """Tally last-window termination reasons."""
+        counts = {}
+        for r in self._ep_reasons:
+            counts[r] = counts.get(r, 0) + 1
+        return counts
+
+    def _sb3_logger_scalar(self, key):
+        """Pull a scalar from SB3's logger name->value map if it exists."""
+        try:
+            log = self.model.logger
+            # SB3 stores the latest logged values in log.name_to_value
+            v = log.name_to_value.get(key)
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
     def _write(self):
         ckpt, ckpt_t = self._scan_latest_checkpoint()
         if ckpt:
@@ -109,6 +160,13 @@ class BeaconCallback(BaseCallback):
         n = len(self._ep_returns)
         avg = lambda d: (sum(d) / len(d)) if d else 0.0
         elapsed = max(1.0, time.time() - self.start_time)
+        # SB3 logs these internally after each train() pass; pulling via
+        # logger is cheap and avoids duplicating PPO's book-keeping.
+        approx_kl = self._sb3_logger_scalar("train/approx_kl")
+        clip_fraction = self._sb3_logger_scalar("train/clip_fraction")
+        entropy_loss = self._sb3_logger_scalar("train/entropy_loss")
+        explained_var = self._sb3_logger_scalar("train/explained_variance")
+        ent_coef_cur = self._sb3_logger_scalar("train/ent_coef")
         beacon = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "ts_unix": int(time.time()),
@@ -125,6 +183,15 @@ class BeaconCallback(BaseCallback):
             "rolling_route_completion": round(avg(self._ep_rcs), 4),
             "rolling_collision_rate": round(avg(self._ep_collisions), 4),
             "rolling_avg_speed_ms": round(avg(self._ep_speeds), 3),
+            # New telemetry per red-team Agent-4:
+            "termination_reasons": self._termination_reason_counts(),
+            "policy_std": round(self._policy_std(), 4) if self._policy_std() is not None else None,
+            "approx_kl": round(approx_kl, 5) if approx_kl is not None else None,
+            "clip_fraction": round(clip_fraction, 4) if clip_fraction is not None else None,
+            "entropy_loss": round(entropy_loss, 4) if entropy_loss is not None else None,
+            "explained_variance": round(explained_var, 4) if explained_var is not None else None,
+            "ent_coef": round(ent_coef_cur, 5) if ent_coef_cur is not None else None,
+            "cumulative_reward_clip_hits": int(self._cumulative_reward_clip_hits),
             "total_episodes": self._ep_count,
             "carla_port": self.carla_port,
             "last_checkpoint": self.last_checkpoint,
