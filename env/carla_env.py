@@ -356,12 +356,15 @@ class CarlaEnv(gym.Env):
         got_image = False
         for _ in range(100):  # ~5s sim time, ~5-15s wall
             try:
-                self.world.tick()
+                # seconds=10.0: if the CARLA server hangs on tick, surface
+                # it as a RuntimeError within 10s instead of blocking the
+                # worker forever (GitHub issue #3: multi-env sync deadlock).
+                self.world.tick(seconds=10.0)
             except RuntimeError as e:
                 # Server hiccup mid-tick. One retry, then raise.
                 print(f"[reset] world.tick() raised {e}; retrying once")
                 time.sleep(0.5)
-                self.world.tick()
+                self.world.tick(seconds=10.0)
             if self.image is not None:
                 got_image = True
                 break
@@ -424,17 +427,22 @@ class CarlaEnv(gym.Env):
             throttle=throttle, steer=steer, brake=brake
         ))
 
-        # Defensive tick: a single transient server hiccup shouldn't kill the
-        # whole rollout. One reconnect+retry, then surface the failure.
+        # Defensive tick with timeout: a single transient server hiccup
+        # shouldn't kill the whole rollout, AND an indefinite hang (GitHub
+        # issue #3: multi-env sync deadlock) must not block SubprocVecEnv
+        # forever. seconds=10.0 turns a hang into a RuntimeError we can
+        # reconnect-retry once, then surface. If the retry also fails,
+        # the worker raises; SubprocVecEnv propagates; PPO crashes with a
+        # clear traceback (which the watchdog can restart from).
         try:
-            self.world.tick()
+            self.world.tick(seconds=10.0)
         except RuntimeError as e:
             print(f"[step] world.tick() raised {e}; reconnecting and retrying once")
             try:
                 self.client = carla.Client(CARLA_HOST, self.port)
                 self.client.set_timeout(20.0)
                 self.world = self.client.get_world()
-                self.world.tick()
+                self.world.tick(seconds=10.0)
             except Exception as e2:
                 raise RuntimeError(f"world.tick() failed after reconnect: {e2}")
 

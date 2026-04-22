@@ -1,15 +1,30 @@
 # PC-Side Claude — v2 Smoke Test Prompt
 
-**Date written:** 2026-04-22 (revised after first-deploy bug fixes)
+**Date written:** 2026-04-22 (revised twice after deploy-side failures)
 **Branch:** `claude/setup-av-training-VetPV`
-**Tip commit:** `79374e5` (fix: post-deploy audit — 5 additional bugs the first smoke test would hit)
-**Purpose:** 10-minute smoke test of a full reward/policy/obs/infra rewrite before committing to a long training run. Goal is to verify the new code boots, gets 4 CARLA envs running, populates the beacon, and does not fire any reward/NaN guards.
+**Tip commit:** `<to-be-updated-after-this-commit>`
+**Purpose:** 10-minute smoke test of a full reward/policy/obs/infra rewrite before committing to a long training run. Goal is to verify the new code boots at the TARGET env count, populates the beacon, and does not fire any reward/NaN guards.
 
-**Revision note:** The first attempt at this smoke test crashed on launch
-(GitHub issue #2 — ENT_COEF_START undefined). A second audit found 4 more
-bugs that would have surfaced within the 10-minute window. Tip `79374e5`
-includes the fix for issue #2 plus all four other fixes. Verify you pull
-the latest — do NOT run against any commit before `79374e5`.
+**Revisions to date:**
+1. First attempt: crashed with ENT_COEF_START UnboundLocalError (GitHub
+   issue #2). Fixed in commit 79374e5 alongside a post-audit fix-pack
+   (5 total bugs).
+2. Second attempt: training completed 1 PPO iteration at 4 envs and then
+   deadlocked (GitHub issue #3 — multi-CARLA sync deadlock, documented
+   failure mode of SubprocVecEnv with multiple CARLA instances on a
+   single GPU under PPO.train() load).
+
+**What changed in the latest revision:**
+- Default `URBANZERO_N_ENVS` for the smoke test is now **2**, matching
+  the prior 7M run's empirically stable configuration (commit 747a28a
+  measured ~100 FPS aggregate there).
+- Added `world.tick(seconds=10.0)` in env/carla_env.py hot paths so any
+  future hang surfaces as a clear RuntimeError within 10s instead of
+  blocking the whole trainer.
+- Do NOT run at 4 envs without explicit discussion with the remote
+  Claude. The deadlock is infrastructure-level, not a code bug the next
+  commit will fix; the literature-supported answer on this hardware is
+  2 envs.
 
 ---
 
@@ -83,12 +98,14 @@ launch (that's GitHub issue #2).
 Make scripts executable:
   chmod +x scripts/preflight.py scripts/watchdog.sh scripts/start_training.sh
 
-=== STEP 2: verify 4 CARLA instances on Windows ===
+=== STEP 2: verify 2 CARLA instances on Windows ===
 
-This test requires FOUR Windows CARLA servers running on ports 2000, 3000,
-4000, 5000. From WSL, verify each:
+This test uses TWO Windows CARLA servers running on ports 2000 and 3000
+(the empirically stable configuration from the prior 7M run — commit
+747a28a confirmed ~100 FPS aggregate throughput there). Do NOT attempt
+4 envs; that's what produced GitHub issue #3. From WSL, verify each:
 
-  for p in 2000 3000 4000 5000; do
+  for p in 2000 3000; do
     if timeout 3 bash -c ">/dev/tcp/172.25.176.1/$p" 2>/dev/null; then
       echo "port $p: UP"
     else
@@ -96,24 +113,29 @@ This test requires FOUR Windows CARLA servers running on ports 2000, 3000,
     fi
   done
 
-If ALL FOUR ports are UP, proceed to STEP 3.
+If BOTH ports are UP, proceed to STEP 3.
 
-If ANY port is DOWN, STOP and paste the exact block below to the user.
+If either is DOWN, STOP and paste the exact block below to the user.
 Do NOT try to launch CARLA yourself from WSL — the paths and permissions
 are fragile, and a failed launch half-holds a port which makes debugging
 worse. The user runs these on the Windows side.
 
 --- paste to user verbatim ---
 
-"CARLA is not running on all four required ports. Please open FOUR
-separate Windows PowerShell windows (or one with four tabs) and run
-the commands below — one per window. Adjust the path if your CARLA
-install is somewhere other than `C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15`.
+"CARLA is not running on both required ports (2000 and 3000). Please
+open TWO separate Windows PowerShell windows and run the commands below
+— one per window. Adjust the path if your CARLA install is somewhere
+other than `C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15`.
 
-After all four have reached the pre-game menu (you'll see a CARLA logo
-and 'Press F1 for help'), come back here and say 'ready'. Leave all four
-windows OPEN for the duration of the smoke test — closing one kills
-training on that worker.
+If you already have FOUR CARLA windows open from the prior attempt,
+close the ones on ports 4000 and 5000 (Task Manager: CarlaUE4.exe,
+pick the right PIDs) — running extra CARLA instances during 2-env
+training wastes VRAM and risks GPU contention.
+
+After BOTH port-2000 and port-3000 instances have reached the pre-game
+menu (you'll see a CARLA logo and 'Press F1 for help'), come back here
+and say 'ready'. Leave both windows OPEN for the duration of the smoke
+test — closing one kills training on that worker.
 
 Window 1 (port 2000):
   cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
@@ -123,46 +145,33 @@ Window 2 (port 3000):
   cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
   .\\CarlaUE4.exe -carla-rpc-port=3000 -quality-level=Low -windowed -ResX=400 -ResY=300
 
-Window 3 (port 4000):
-  cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
-  .\\CarlaUE4.exe -carla-rpc-port=4000 -quality-level=Low -windowed -ResX=400 -ResY=300
-
-Window 4 (port 5000):
-  cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
-  .\\CarlaUE4.exe -carla-rpc-port=5000 -quality-level=Low -windowed -ResX=400 -ResY=300
-
 Flags explained:
   -carla-rpc-port=<N>   : which port the CARLA server listens on (each
                           trainer worker connects to one of these)
-  -quality-level=Low    : lowest render quality. Required on 4x
-                          concurrent instances on 16 GB VRAM — Epic
-                          quality will OOM. Training uses semantic seg
-                          not RGB, so render quality doesn't affect the
-                          agent's observations.
+  -quality-level=Low    : lowest render quality. Training uses semantic
+                          seg not RGB, so render quality doesn't affect
+                          the agent's observations.
   -windowed             : windowed mode (not fullscreen), lets you see
-                          all four at once to confirm they're running
-  -ResX=400 -ResY=300   : tiny windows. Further reduces VRAM and CPU
-                          cost of the spectator render.
+                          both at once to confirm they're running
+  -ResX=400 -ResY=300   : tiny windows. Reduces VRAM and CPU cost of
+                          the spectator render.
 
-If any instance fails to launch with 'server already running' or similar,
-that port is held by a stale process. Kill it in Task Manager (look for
-CarlaUE4.exe) and try again.
+If either instance fails to launch with 'server already running' or
+similar, that port is held by a stale process. Kill it in Task Manager
+(look for CarlaUE4.exe) and try again.
 
-Optional: if you want a console log from CARLA to diagnose crashes, add
-  -log -LogCmds='LogAll Verbose'
-to the command — the log goes to the CARLA window's terminal.
-
-Once all four are at the pre-game menu, reply 'ready'."
+Once both are at the pre-game menu, reply 'ready'."
 
 --- end paste ---
 
 After the user replies 'ready', re-run the port check loop. Do NOT proceed
-until all four report UP. Do not launch with fewer envs on your own — the
-test is specifically of the 4-env configuration.
+until both ports report UP.
 
-If you find ONLY 1 or 2 ports reachable and the user insists those are all
-that will run (e.g., hardware not cooperating), STOP and report back; the
-remote Claude will issue a new smoke-test config for 2-env or 3-env.
+Why 2 envs, not 4: a prior 4-env attempt hung indefinitely after the
+first PPO training pass (GitHub issue #3 — multi-CARLA sync deadlock).
+Do NOT attempt 4 envs without explicit direction from the remote Claude.
+If the user pushes for more envs, STOP and ask — the issue is
+infrastructure-level, not something the smoke test can safely explore.
 
 === STEP 3: archive any prior experiment directory ===
 
@@ -181,12 +190,12 @@ Fresh run means fresh checkpoint dir. Prevent auto-resume ambiguity:
 === STEP 4: run preflight ===
 
   export URBANZERO_EXP=v2_rl
-  export URBANZERO_N_ENVS=4
+  export URBANZERO_N_ENVS=2
   export URBANZERO_BASE_PORT=2000
   python3 scripts/preflight.py
 
-Expected output: all 9+ checks show [ OK ]. There should now be 3 extra
-"CARLA port NNNN" checks (one per additional env). If preflight FAILS, do
+Expected output: all 10 checks show [ OK ] (9 base checks + 1 extra
+"CARLA port 3000" check for the second env). If preflight FAILS, do
 NOT bypass it — paste the failure lines and STOP.
 
 === STEP 5: launch the smoke test ===
@@ -200,7 +209,7 @@ Kill any prior training/watchdog sessions first:
 Launch with SMOKE-TEST-SPECIFIC env vars:
 
   URBANZERO_EXP=v2_rl \
-  URBANZERO_N_ENVS=4 \
+  URBANZERO_N_ENVS=2 \
   URBANZERO_BASE_PORT=2000 \
   URBANZERO_TIMESTEPS=10000000 \
   URBANZERO_AUTO_RESUME=0 \
@@ -218,7 +227,7 @@ Attach briefly to confirm it started:
 
 You should see:
   - "=== UrbanZero Training ==="
-  - "  Envs: 4"
+  - "  Envs: 2"
   - "Device: cuda"
   - "Starting training for 10,000,000 timesteps..."
   - tqdm progress bar appearing
@@ -227,6 +236,11 @@ If the process dies in the first 60 seconds, paste the last 50 lines:
   LOG=$(ls -t ~/urbanzero/logs/v2_rl/train_*.log | head -1)
   tail -50 "$LOG"
 and STOP.
+
+Watch specifically for `world.tick() raised ...` messages. The new
+env/carla_env.py uses `world.tick(seconds=10.0)` so any CARLA hang
+surfaces as a logged RuntimeError within 10s instead of deadlocking
+silently (the failure mode from GitHub issue #3).
 
 === STEP 6: monitor for 10 minutes ===
 
@@ -251,8 +265,9 @@ Then evaluate against these gates:
 
 PASS ALL to declare smoke-test green:
   [P1] beacon "timesteps" >= 40000        (= aggregate >=67 FPS over 10 min)
-  [P2] beacon "fps" >= 80                 (4-env aggregate target per
-                                           remote Claude's hardware math)
+  [P2] beacon "fps" >= 70                 (2-env aggregate target; prior
+                                           7M run at 2 envs measured ~100
+                                           FPS so 70 is a conservative floor)
   [P3] grep count NaN-GUARD == 0
   [P4] grep count reward-guard == 0
   [P5] beacon "cumulative_reward_clip_hits" == 0
@@ -266,8 +281,13 @@ PASS ALL to declare smoke-test green:
   [P8] beacon "approx_kl" is not None (SB3 has produced >=1 training pass)
 
 FAIL signals (any one means stop and triage, not "try again"):
-  [F1] fps < 60 aggregate: 4-env config is too heavy. Report VRAM and
-       drop to 3 envs on the remote side.
+  [F1] fps < 50 aggregate at 2 envs: unexpected — prior 2-env runs hit
+       ~100. Report VRAM, GPU util, and current CARLA window count to
+       the remote side.
+  [F1a] process hangs / no log output for >60s (same symptom as GitHub
+       issue #3, but should no longer happen at 2 envs + 10s world.tick
+       timeout). If it does, capture `py-spy dump --pid <trainer-pid>`
+       if py-spy is available, else `ps auxf` showing trainer state.
   [F2] any NaN-GUARD or reward-guard line in the log.
   [F3] beacon "termination_reasons" heavily dominated by one reason
        (>80%) within the first 50 episodes. Note: 80% REALLY_STUCK
@@ -287,7 +307,8 @@ Paste this EXACT template back to the user, filling in every slot:
 
   === v2 SMOKE TEST REPORT (10 min) ===
   tip commit: <git rev-parse HEAD>
-  CARLA ports: 2000/3000/4000/5000 all UP: <yes/no>
+  CARLA ports: 2000/3000 UP: <yes/no>
+  n_envs used: 2
   timesteps after 10 min: <n>
   aggregate FPS: <fps>
   policy_std: <value>
@@ -307,7 +328,7 @@ Paste this EXACT template back to the user, filling in every slot:
 
   PASS gates (P1..P8):
   P1 >=40k timesteps : PASS / FAIL (<actual>)
-  P2 >=80 FPS        : PASS / FAIL (<actual>)
+  P2 >=70 FPS        : PASS / FAIL (<actual>)
   P3 NaN=0           : PASS / FAIL (<actual>)
   P4 reward-guard=0  : PASS / FAIL (<actual>)
   P5 clip_hits=0     : PASS / FAIL (<actual>)
@@ -341,7 +362,7 @@ what broke the 7M run.
 
 - **Experiment name `v2_rl`.** This is a fresh namespace: checkpoints go to `~/urbanzero/checkpoints/v2_rl/`, logs to `~/urbanzero/logs/v2_rl/`. Your prior `shaped` / `phase1_notraffic` / `phase2_traffic` directories are untouched — you can still look at the old data if needed.
 
-- **Why 10 minutes and not 30.** The smoke test isn't trying to learn anything. It's proving the new stack doesn't crash, achieves target FPS on 4 envs, and populates the new telemetry correctly. 10 minutes is enough to see ~40k+ env-steps, ~50 episodes, and at least one PPO `train()` pass (which fires at `n_steps * n_envs = 256 * 4 = 1024` steps).
+- **Why 10 minutes and not 30.** The smoke test isn't trying to learn anything. It's proving the new stack doesn't crash, achieves target FPS on 2 envs, and populates the new telemetry correctly. 10 minutes is enough to see ~40k+ env-steps, ~50 episodes, and several PPO `train()` passes (which fire every `n_steps * n_envs = 512 * 2 = 1024` steps at 2 envs — same rollout size as before).
 
 - **What happens if smoke test FAILS gate F1 (FPS too low).** Drop to 3 envs — i.e. shut down the CARLA instance on port 5000, set `URBANZERO_N_ENVS=3`, and re-run the smoke test. At 3 envs we lose ~20% sample diversity but VRAM pressure drops substantially.
 
