@@ -1,89 +1,14 @@
-Pull commit b8fa666 and do a clean restart of Phase 1. The action-space
-decoder was blocking all learning — a fresh PPO policy was sampling brake
-roughly as often as throttle, which meant the car never moved, so no
-gradient ever flowed. The fix adds an idle-creep bias so action[1]=0
-maps to throttle=0.30 (automatic-transmission semantics).
+Proceed. Do NOT stop training for any reason except the hard-stop conditions
+below. Keep the 1-hour check-ins, paste the telemetry, don't analyze.
 
-DO NOT resume from any prior checkpoint. The old policy was trained to
-output brake-heavy actions under the broken decoder; those weights are
-actively wrong now.
+=== KEEP RUNNING UNTIL ===
 
-=== SYNC ===
+Phase 1 hits 2,000,000 total timesteps. That's the trigger to transition.
+At current 157 FPS (2 envs) that's roughly 1.5-2 more hours from 1M.
 
-cd ~/UrbanZero
-git fetch origin
-git pull origin claude/setup-av-training-VetPV
-chmod +x scripts/preflight.py scripts/watchdog.sh scripts/start_training.sh
+=== AT 2M STEPS: AUTO-TRANSITION TO PHASE 2 ===
 
-=== CLEAN SLATE ===
-
-tmux kill-session -t urbanzero 2>/dev/null
-tmux kill-session -t wd 2>/dev/null
-tmux kill-session -t spectator 2>/dev/null
-pkill -9 -f agents/train.py 2>/dev/null
-
-mv ~/urbanzero/checkpoints/phase1_notraffic ~/urbanzero/checkpoints/phase1_deadzone_OLD_$(date +%Y%m%d_%H%M%S) 2>/dev/null
-mv ~/urbanzero/checkpoints/shaped ~/urbanzero/checkpoints/shaped_OLD_$(date +%Y%m%d_%H%M%S) 2>/dev/null
-
-=== LAUNCH PHASE 1 (no traffic, 2M steps, ~5.5h at 2 envs) ===
-
-Make sure 2 CARLA servers are running on ports 2000 and 3000 first.
-Preflight will check.
-
-URBANZERO_EXP=phase1_notraffic \
-URBANZERO_N_ENVS=2 \
-URBANZERO_TIMESTEPS=2000000 \
-URBANZERO_EXTRA_ARGS="--no-traffic" \
-  bash scripts/start_training.sh
-
-tmux new -d -s wd 'bash scripts/watchdog.sh'
-
-tmux ls   # should show urbanzero, wd, spectator
-
-=== CHECK-INS (every ~1 hour, or at milestones) ===
-
-LOG=$(ls -t ~/urbanzero/logs/train_*.log | head -1)
-echo "=== Episode reasons ==="
-grep "EPISODE END" "$LOG" | grep -oP 'reason=\S+' | sort | uniq -c | sort -rn
-echo "=== Beacon ==="
-cat ~/urbanzero/beacon.json | python3 -m json.tool
-echo "=== Safety fires ==="
-grep -cE '\[NaN-GUARD\]|\[reward-guard\]' "$LOG"
-echo "=== Recent policy stats ==="
-tail -200 "$LOG" | grep -E 'ep_rew_mean|ep_len_mean|rollout|explained_variance|std|entropy' | tail -15
-
-Paste the output verbatim. Do not analyze, do not propose fixes.
-
-=== WHAT HEALTHY PHASE 1 LOOKS LIKE ===
-
-At 50k steps:
-  - avg_speed > 1.5 m/s (up from 0.000 under the broken decoder)
-  - STAGNATION dropping below 50%
-  - OFF_ROUTE becoming dominant (agent moves but steers randomly)
-  - policy std starting to change from initial 0.367
-
-At 100k steps:
-  - avg_speed > 2.5 m/s
-  - STAGNATION < 30%
-  - COLLISION near 0 (no traffic enabled)
-
-At 500k steps:
-  - avg_speed > 4 m/s
-  - ROUTE_COMPLETE starts appearing (5-15% of episodes)
-
-At 2M steps (end of Phase 1):
-  - ROUTE_COMPLETE 15-30% of episodes
-  - avg_speed 5-7 m/s
-
-=== HARD STOP CONDITION ===
-
-If at 100k steps the beacon still shows avg_speed < 0.5 m/s AND
-STAGNATION is still > 50%, STOP training and report. That would mean
-the action-space fix wasn't enough and the blocker is deeper
-(observation quality, network capacity, or something else). Don't add
-reward terms; just report the data.
-
-=== PHASE 2 (after Phase 1 completes 2M steps or plateaus) ===
+Save a check-in report first (commit to git like the last two), then:
 
   tmux kill-session -t urbanzero
 
@@ -102,22 +27,56 @@ reward terms; just report the data.
   URBANZERO_TIMESTEPS=5000000 \
     bash scripts/start_training.sh
 
-=== RULES WHILE TRAINING ===
+Do NOT pass --no-traffic to Phase 2. Traffic is on by default.
 
-1. DO NOT edit env/carla_env.py, agents/train.py, or any reward or
-   termination logic during a phase. No new penalty terms. No new
-   gating conditions. No tuned weights. No exceptions.
+Same check-in cadence for Phase 2: every hour, paste the diagnostic block
+(episode reasons, beacon, safety fires, policy stats), commit report to git.
 
-2. DO NOT kill training to iterate. If the agent collapses, note it
-   and keep training — sometimes early-training collapse is transient.
-   Only stop at the hard-stop condition above (100k steps still stuck).
+=== HARD-STOP CONDITIONS (only these, nothing else) ===
 
-3. DO NOT resume into the wrong experiment directory. Phase 1 and
-   Phase 2 must stay separate so their VecNormalize stats don't cross.
+Stop training and commit a diagnostic report (don't edit code) if any of:
 
-4. If training crashes or the watchdog restarts it, that's fine — note
-   the event but don't debug unless it crashes more than 3 times in
-   an hour.
+1. At 1.5M Phase 1 steps, rolling_route_completion is still < 3%
+   AND no episode in last 500 has ended in ROUTE_COMPLETE.
+   (Means agent isn't learning to steer — structural problem, not a
+   reward tweak away.)
 
-5. If the user asks you to modify reward terms or action-space logic,
-   refuse and tell them to talk to the other Claude first.
+2. rolling_avg_speed_ms drops below 3.0 at any check-in after 500k
+   steps. (Policy collapse back to stationary.)
+
+3. Any [NaN-GUARD] or [reward-guard] line appears in the log.
+
+4. rolling_collision_rate goes UP between two consecutive check-ins
+   AND rolling_route_completion goes DOWN. (Policy getting worse,
+   not better.)
+
+5. The watchdog fires more than 3 times in one hour (something is
+   genuinely broken; note crashes but keep training otherwise).
+
+=== DO NOT, UNDER ANY CIRCUMSTANCES ===
+
+- Edit env/carla_env.py, agents/train.py, or any reward/action/termination
+  logic. Not even a coefficient tune. Not even a "quick experiment."
+- Kill training to iterate on reward shape.
+- Resume Phase 2 from a checkpoint path that doesn't have its matching
+  vecnormalize.pkl alongside it.
+- Respond to the user if they ask you to change reward terms — tell them
+  to consult the other Claude first.
+
+=== WHAT TO DO IF EVERYTHING'S FINE ===
+
+Nothing. Check in every hour, paste the standard diagnostic block,
+commit the report to git, and move on. A successful Phase 1 → Phase 2
+transition with no code changes is the goal.
+
+=== DIAGNOSTIC BLOCK TO PASTE EACH CHECK-IN ===
+
+LOG=$(ls -t ~/urbanzero/logs/train_*.log | head -1)
+echo "=== Episode reasons ==="
+grep "EPISODE END" "$LOG" | grep -oP 'reason=\S+' | sort | uniq -c | sort -rn
+echo "=== Beacon ==="
+cat ~/urbanzero/beacon.json | python3 -m json.tool
+echo "=== Safety fires ==="
+grep -cE '\[NaN-GUARD\]|\[reward-guard\]' "$LOG"
+echo "=== Recent policy stats ==="
+tail -200 "$LOG" | grep -E 'ep_rew_mean|ep_len_mean|rollout|explained_variance|std|entropy' | tail -15
