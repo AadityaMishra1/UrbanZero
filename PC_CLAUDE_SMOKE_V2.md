@@ -83,14 +83,73 @@ This test requires FOUR Windows CARLA servers running on ports 2000, 3000,
     fi
   done
 
-If any port is DOWN, STOP and tell the user:
-  "CARLA on port <X> is not reachable. On Windows, launch an additional
-   CarlaUE4.exe instance with: CarlaUE4.exe -carla-rpc-port=<X>
-   -quality-level=Low. Recommended to launch all four at quality=Low so
-   VRAM stays under 16 GB on the 4080 Super."
+If ALL FOUR ports are UP, proceed to STEP 3.
 
-Do not proceed until all four ports are UP. Do not launch with fewer envs
-on your own — the test is specifically of the 4-env configuration.
+If ANY port is DOWN, STOP and paste the exact block below to the user.
+Do NOT try to launch CARLA yourself from WSL — the paths and permissions
+are fragile, and a failed launch half-holds a port which makes debugging
+worse. The user runs these on the Windows side.
+
+--- paste to user verbatim ---
+
+"CARLA is not running on all four required ports. Please open FOUR
+separate Windows PowerShell windows (or one with four tabs) and run
+the commands below — one per window. Adjust the path if your CARLA
+install is somewhere other than `C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15`.
+
+After all four have reached the pre-game menu (you'll see a CARLA logo
+and 'Press F1 for help'), come back here and say 'ready'. Leave all four
+windows OPEN for the duration of the smoke test — closing one kills
+training on that worker.
+
+Window 1 (port 2000):
+  cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
+  .\\CarlaUE4.exe -carla-rpc-port=2000 -quality-level=Low -windowed -ResX=400 -ResY=300
+
+Window 2 (port 3000):
+  cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
+  .\\CarlaUE4.exe -carla-rpc-port=3000 -quality-level=Low -windowed -ResX=400 -ResY=300
+
+Window 3 (port 4000):
+  cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
+  .\\CarlaUE4.exe -carla-rpc-port=4000 -quality-level=Low -windowed -ResX=400 -ResY=300
+
+Window 4 (port 5000):
+  cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
+  .\\CarlaUE4.exe -carla-rpc-port=5000 -quality-level=Low -windowed -ResX=400 -ResY=300
+
+Flags explained:
+  -carla-rpc-port=<N>   : which port the CARLA server listens on (each
+                          trainer worker connects to one of these)
+  -quality-level=Low    : lowest render quality. Required on 4x
+                          concurrent instances on 16 GB VRAM — Epic
+                          quality will OOM. Training uses semantic seg
+                          not RGB, so render quality doesn't affect the
+                          agent's observations.
+  -windowed             : windowed mode (not fullscreen), lets you see
+                          all four at once to confirm they're running
+  -ResX=400 -ResY=300   : tiny windows. Further reduces VRAM and CPU
+                          cost of the spectator render.
+
+If any instance fails to launch with 'server already running' or similar,
+that port is held by a stale process. Kill it in Task Manager (look for
+CarlaUE4.exe) and try again.
+
+Optional: if you want a console log from CARLA to diagnose crashes, add
+  -log -LogCmds='LogAll Verbose'
+to the command — the log goes to the CARLA window's terminal.
+
+Once all four are at the pre-game menu, reply 'ready'."
+
+--- end paste ---
+
+After the user replies 'ready', re-run the port check loop. Do NOT proceed
+until all four report UP. Do not launch with fewer envs on your own — the
+test is specifically of the 4-env configuration.
+
+If you find ONLY 1 or 2 ports reachable and the user insists those are all
+that will run (e.g., hardware not cooperating), STOP and report back; the
+remote Claude will issue a new smoke-test config for 2-env or 3-env.
 
 === STEP 3: archive any prior experiment directory ===
 
