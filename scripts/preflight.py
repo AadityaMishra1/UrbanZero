@@ -112,6 +112,13 @@ def check_python_deps():
 def main():
     host = os.environ.get("CARLA_HOST", "172.25.176.1")
     port = int(os.environ.get("CARLA_PORT", "2000"))
+    # Multi-env support — if URBANZERO_N_ENVS>1 we verify every CARLA
+    # instance (port = BASE_PORT + i*1000), not just the base port.
+    # Agent-4 audit: without this, a missing 3000/4000/5000 CARLA instance
+    # would pass preflight and then deadlock SubprocVecEnv during worker
+    # init with no clear error to the user.
+    n_envs = int(os.environ.get("URBANZERO_N_ENVS", "1"))
+    base_port = int(os.environ.get("URBANZERO_BASE_PORT", str(port)))
     experiment = os.environ.get("URBANZERO_EXP", "shaped")
     ckpt_dir = os.path.expanduser(f"~/urbanzero/checkpoints/{experiment}")
     log_dir = os.path.expanduser(f"~/urbanzero/logs/{experiment}")
@@ -119,6 +126,7 @@ def main():
 
     print("=== UrbanZero pre-flight ===")
     print(f"  CARLA target: {host}:{port}")
+    print(f"  n_envs:       {n_envs} (base port {base_port})")
     print(f"  Experiment:   {experiment}")
     print(f"  Checkpoints:  {ckpt_dir}")
     print()
@@ -128,6 +136,17 @@ def main():
         ("Python deps",            check_python_deps,          ()),
         ("CARLA world handshake",  check_carla_tick,           (host, port)),
         ("Route planner import",   check_route_planner_import, ()),
+    ]
+    # Extra CARLA ports when running multi-env: each worker connects to
+    # base_port + rank*1000, so all of those must be reachable too.
+    if n_envs > 1:
+        for i in range(1, n_envs):
+            extra_port = base_port + i * 1000
+            checks.append(
+                (f"CARLA port {extra_port}",
+                 check_carla_port, (host, extra_port))
+            )
+    checks += [
         ("Checkpoint dir",         check_dir_writable,         (ckpt_dir,)),
         ("Log dir",                check_dir_writable,         (log_dir,)),
         ("Beacon dir",             check_dir_writable,         (home_dir,)),

@@ -37,6 +37,17 @@ restart_trainer() {
     pkill -TERM -f "agents/train.py" 2>/dev/null
     sleep 5
     pkill -KILL -f "agents/train.py" 2>/dev/null
+    # Randomize seed on restart: the prior behavior replayed the fixed
+    # URBANZERO_SEED, so every watchdog restart resampled the SAME spawn
+    # points / weather / traffic sequences the policy had just seen.
+    # Agent-4 audit flagged this as "compressed domain randomization" —
+    # policy memorizes sequences instead of dynamics. $RANDOM is 0-32767
+    # on both bash and zsh, which is plenty for seeding variety.
+    if [ -z "${URBANZERO_SEED_LOCKED:-}" ]; then
+        NEW_SEED=$RANDOM
+        export URBANZERO_SEED=$NEW_SEED
+        log "Re-seeded URBANZERO_SEED=$NEW_SEED (set URBANZERO_SEED_LOCKED=1 to disable)"
+    fi
     bash "$START_SCRIPT"
     log "Trainer restart issued. Sleeping ${WARMUP_SEC}s for warmup."
     sleep "$WARMUP_SEC"

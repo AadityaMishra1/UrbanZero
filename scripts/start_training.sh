@@ -55,8 +55,18 @@ if [ "$#" -ge 1 ]; then
         EXTRA_ARGS="$EXTRA_ARGS $*"
     fi
 fi
-# Fall back to latest checkpoint in this experiment's dir if none specified.
-if [ -z "$CKPT" ]; then
+# Phase-aware auto-resume: BC-phase experiments write nn.Module state_dicts
+# (not SB3 model zips), so the auto-resume that works for PPO phases would
+# crash PPO.load() with a format error on watchdog restart. For any experiment
+# whose name contains 'bc', skip the auto-resume fallback. User can still
+# explicitly --resume by passing the path as $1.
+# URBANZERO_AUTO_RESUME=0 also disables it globally (useful for fresh runs).
+AUTO_RESUME="${URBANZERO_AUTO_RESUME:-1}"
+if [[ "$EXPERIMENT" == *bc* ]]; then
+    AUTO_RESUME=0
+    echo "BC phase detected (exp=$EXPERIMENT) — auto-resume disabled"
+fi
+if [ -z "$CKPT" ] && [ "$AUTO_RESUME" = "1" ]; then
     CKPT="$(ls -t "$CKPT_DIR"/autosave_*_steps.zip "$CKPT_DIR"/ppo_urbanzero_*_steps.zip "$CKPT_DIR"/emergency_*_steps.zip 2>/dev/null | head -1)"
 fi
 RESUME=""
