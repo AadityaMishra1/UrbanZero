@@ -627,9 +627,19 @@ class CarlaEnv(gym.Env):
         throttle_brake = float(np.clip(action[1], -1.0, 1.0))
 
         # 1. Route progress — primary positive signal (CaRL / Roach §3.3).
+        # CAPPED at TARGET_SPEED-equivalent distance per step. Without
+        # this cap, the 1.5m physical-plausibility clamp meant the agent
+        # kept getting more reward up to ~22 m/s. Phase 1 at 1M steps
+        # showed the agent converged to 18 m/s (65 km/h) in a
+        # 30 km/h urban zone — the reward design was silently paying
+        # for overspeed. Capping at TARGET (0.42m/step) makes TARGET
+        # the reward-optimal speed; going faster pays the SAME progress
+        # while losing speed_reward (triangle falls off above TARGET)
+        # AND paying overspeed_penalty above MAX_SPEED.
         progress_delta = self._advance_route_index()
         self.route_progress += progress_delta
-        progress_reward = progress_delta * 2.0
+        TARGET_PROGRESS_CAP = TARGET_SPEED * 0.05  # = 0.4165 m per tick
+        progress_reward = min(progress_delta, TARGET_PROGRESS_CAP) * 2.0
 
         # 2. Speed reward, signed by route alignment.
         # Triangle-shaped peak at TARGET_SPEED, falls to 0 at MAX_SPEED.
@@ -639,6 +649,16 @@ class CarlaEnv(gym.Env):
             speed_reward = 0.3 * (1.0 - (speed - TARGET_SPEED) / (MAX_SPEED - TARGET_SPEED))
         else:
             speed_reward = 0.0  # over-speed: no reward, no divide-by-zero
+
+        # 2b. Overspeed penalty above MAX_SPEED.
+        # Linear ramp: 0 at MAX (14 m/s), -0.3 at 2*MAX (28 m/s = 100 km/h).
+        # Ensures speed above MAX actively costs reward, not just zeros
+        # speed_reward. Combined with the progress cap above, the
+        # reward-optimal speed under the new design is exactly TARGET_SPEED
+        # (30 km/h urban) — at TARGET: +0.83 progress +0.3 speed = 1.13;
+        # at MAX: +0.83 progress (capped) +0 speed = 0.83; at 17 m/s:
+        # +0.83 progress +0 speed -0.064 overspeed = 0.766.
+        overspeed_penalty = -0.3 * max(0.0, (speed - MAX_SPEED) / MAX_SPEED)
 
         # SIGNED alignment — cos(angle_diff) in [-1, +1]. Wrong-way and
         # perpendicular driving give NEGATIVE r_speed. Figure-8 averages
@@ -737,7 +757,8 @@ class CarlaEnv(gym.Env):
         else:
             idle_penalty = -1.0 * (1.5 - speed) / 1.5  # [-1.0 .. 0] linear
 
-        reward = progress_reward + speed_reward + lateral_penalty + smoothness_penalty + idle_penalty
+        reward = (progress_reward + speed_reward + overspeed_penalty
+                  + lateral_penalty + smoothness_penalty + idle_penalty)
 
         # Stagnation counter — catches stopped/crawling cars.
         # Truncates after 150 steps (7.5s). More permissive gating than
