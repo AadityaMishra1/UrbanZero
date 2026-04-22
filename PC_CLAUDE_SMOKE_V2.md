@@ -2,7 +2,7 @@
 
 **Date written:** 2026-04-22 (revised twice after deploy-side failures)
 **Branch:** `claude/setup-av-training-VetPV`
-**Tip commit:** `<to-be-updated-after-this-commit>`
+**Tip commit:** `fa325e1` (fix: fall back to 2 envs after multi-CARLA sync deadlock (issue #3))
 **Purpose:** 10-minute smoke test of a full reward/policy/obs/infra rewrite before committing to a long training run. Goal is to verify the new code boots at the TARGET env count, populates the beacon, and does not fire any reward/NaN guards.
 
 **Revisions to date:**
@@ -79,21 +79,15 @@ Pull:
   git pull
   git log --oneline -6
 
-Verify the top 8 commits match (order is newest first — includes the
-post-audit fix pack):
+Verify the current tip matches:
 
-  79374e5 fix: post-deploy audit — 5 additional bugs the first smoke test would hit
-  8d86025 docs: include explicit Windows CarlaUE4.exe launch commands in smoke prompt
-  c46d3dc docs: paste-ready PC-side Claude smoke-test prompt for v2 stack
-  2f9fe00 infra: watchdog seed-rand, preflight multi-port, BC-phase auto-resume guard
-  0612756 beacon: add exploration/KL/termination_reason telemetry
-  3e8845c train: ent_coef 0.02→0.01 anneal, RollingBest ckpt, PPO-default hypers
-  800fb4d policy: soft upper log_std bound only (std<=1.0), no lower floor
-  a0ac534 env: CaRL-minimal reward, 10-dim state, termination_reason telemetry
+  fa325e1 fix: fall back to 2 envs after multi-CARLA sync deadlock (issue #3)
 
-If `79374e5` (the fix-pack) is NOT the current HEAD, STOP and pull again —
-running any earlier tip will crash on ENT_COEF_START within seconds of
-launch (that's GitHub issue #2).
+If `fa325e1` is NOT the current HEAD, STOP and pull again. Running any
+earlier tip will either:
+  - crash on ENT_COEF_START (any tip before 79374e5 — GitHub issue #2), or
+  - deadlock at iteration 2 with 4 envs (any tip before fa325e1 — GitHub
+    issue #3)
 
 Make scripts executable:
   chmod +x scripts/preflight.py scripts/watchdog.sh scripts/start_training.sh
