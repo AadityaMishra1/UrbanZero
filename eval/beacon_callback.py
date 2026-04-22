@@ -166,7 +166,16 @@ class BeaconCallback(BaseCallback):
         clip_fraction = self._sb3_logger_scalar("train/clip_fraction")
         entropy_loss = self._sb3_logger_scalar("train/entropy_loss")
         explained_var = self._sb3_logger_scalar("train/explained_variance")
+        # ent_coef is recorded by EntCoefAnnealCallback; fall back to reading
+        # the current PPO attribute directly if the logger hasn't flushed yet.
         ent_coef_cur = self._sb3_logger_scalar("train/ent_coef")
+        if ent_coef_cur is None:
+            try:
+                raw = getattr(self.model, "ent_coef", None)
+                if raw is not None:
+                    ent_coef_cur = float(raw)
+            except Exception:
+                ent_coef_cur = None
         beacon = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "ts_unix": int(time.time()),

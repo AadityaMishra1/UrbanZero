@@ -97,6 +97,11 @@ class EntCoefAnnealCallback(BaseCallback):
         frac = min(1.0, max(0.0, t / self.anneal_steps))
         new_coef = self.start_value + frac * (self.floor_value - self.start_value)
         self.model.ent_coef = new_coef
+        # Record to SB3 logger so BeaconCallback can surface the current
+        # coefficient. SB3 does not auto-log ent_coef for PPO; if we don't
+        # record it here the beacon's "ent_coef" field is always None.
+        # record() is cheap (no-op until next dump); safe to call every step.
+        self.model.logger.record("train/ent_coef", float(new_coef))
         if self.verbose and (t - self._last_logged_at) >= 100_000:
             print(f"[ent_coef_sched] t={t} ent_coef={new_coef:.4f}")
             self._last_logged_at = t
@@ -227,6 +232,17 @@ def main():
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CKPT_DIR, exist_ok=True)
 
+    # Entropy coefficient schedule constants — hoisted above callback
+    # construction because the EntCoefAnnealCallback constructor reads them.
+    # Andrychowicz 2021 benchmarks 0.003-0.03 as the viable band for
+    # continuous control from scratch; 0.001 (prior run) is below that
+    # and caused the documented entropy collapse (std: 0.367 -> 0.230,
+    # entropy_loss: -0.831 -> +0.115). The 0.01 floor (not 0) is critical
+    # per the same paper — dropping ent_coef to 0 late in training is the
+    # Rajeswaran et al. 2017 collapse-trigger we're avoiding.
+    ENT_COEF_START = 0.02
+    ENT_COEF_FLOOR = 0.01
+
     print(f"=== UrbanZero Training ===")
     print(f"  Envs: {args.n_envs}")
     print(f"  Timesteps: {args.timesteps:,}")
@@ -235,6 +251,7 @@ def main():
     print(f"  Experiment: {args.experiment}")
     print(f"  Log dir: {LOG_DIR}")
     print(f"  Checkpoint dir: {CKPT_DIR}")
+    print(f"  Ent-coef schedule: {ENT_COEF_START} -> {ENT_COEF_FLOOR} (floor) over 10M steps")
 
     # Create vectorized environment
     env_fns = [
@@ -331,16 +348,6 @@ def main():
     # Scale batch parameters with number of envs
     n_steps = 512 if args.n_envs <= 2 else 256
     batch_size = 64 * args.n_envs  # scale with envs
-
-    # Entropy coefficient schedule: start 0.02, anneal to 0.01 as a FLOOR.
-    # Andrychowicz 2021 benchmarks 0.003-0.03 as the viable band for
-    # continuous control from scratch; 0.001 (prior run) is below that
-    # and caused the documented entropy collapse (std: 0.367 -> 0.230,
-    # entropy_loss: -0.831 -> +0.115). The 0.01 floor (not 0) is critical
-    # per the same paper — dropping ent_coef to 0 late in training is the
-    # Rajeswaran et al. 2017 collapse-trigger we're avoiding.
-    ENT_COEF_START = 0.02
-    ENT_COEF_FLOOR = 0.01
 
     if args.resume:
         print(f"Resuming from: {args.resume}")

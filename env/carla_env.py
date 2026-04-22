@@ -152,6 +152,14 @@ class CarlaEnv(gym.Env):
             os.environ.get("URBANZERO_CARROT_DECAY_STEPS",
                            str(self.CARROT_DECAY_STEPS_DEFAULT))
         )
+        # Guard against zero-or-negative anneal horizon (would divide by zero
+        # in _compute_reward). If the user wants the carrot disabled, they
+        # can set the env var to 1 — the anneal will zero out after one step.
+        if self._carrot_decay_steps <= 0:
+            print(f"[CarlaEnv] URBANZERO_CARROT_DECAY_STEPS={self._carrot_decay_steps} "
+                  f"invalid (must be >0); falling back to default "
+                  f"{self.CARROT_DECAY_STEPS_DEFAULT}")
+            self._carrot_decay_steps = self.CARROT_DECAY_STEPS_DEFAULT
 
         # Termination-reason emitter: _compute_reward writes the last
         # terminal's reason string here, step() reads it into info.

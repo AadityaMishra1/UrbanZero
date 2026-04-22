@@ -45,6 +45,12 @@ class NaNGuardWrapper(Wrapper):
             info = dict(info)
             info["nan_terminated"] = True
             info["guard_hits_total"] = self._guard_hits
+            # Stamp the termination reason so BeaconCallback's termination_reasons
+            # tally doesn't mis-classify as "UNKNOWN". Env-side _compute_reward
+            # leaves termination_reason=None on non-terminal steps; if the guard
+            # fires on such a step and we don't override, the beacon loses the
+            # signal that a NaN-guard actually triggered the terminal.
+            info["termination_reason"] = "NAN_GUARD"
         return obs, reward, terminated, truncated, info
 
     def reset(self, **kwargs):

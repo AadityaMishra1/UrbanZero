@@ -46,7 +46,14 @@ class DrivingCNN(BaseFeaturesExtractor):
 
         n_channels = image_space.shape[0]  # should be 1 (or 4 with frame stacking)
         h, w = image_space.shape[1], image_space.shape[2]
-        state_dim = state_space.shape[0]
+
+        # state_dim is robust to VecFrameStack's shape convention: with
+        # channels_order={"state": "last"} on a (10,) space, SB3 produces
+        # (40,) — but older SB3 versions may produce (10, 4). np.prod handles
+        # both and matches whatever the runtime batch actually carries after
+        # Flatten in forward().
+        import numpy as _np
+        state_dim = int(_np.prod(state_space.shape))
 
         # Image CNN pathway (5 conv layers with LayerNorm)
         self.cnn = nn.Sequential(
@@ -95,6 +102,13 @@ class DrivingCNN(BaseFeaturesExtractor):
     def forward(self, observations: dict) -> torch.Tensor:
         image = observations["image"].float()
         state = observations["state"].float()
+
+        # Flatten state defensively: shape after VecFrameStack may be either
+        # (B, state_dim) or (B, base_state_dim, n_stack) depending on the
+        # installed SB3 version's "last"-stacking convention. np.prod was used
+        # to size state_mlp so flatten-to-(B, state_dim) matches either way.
+        if state.dim() > 2:
+            state = state.flatten(1)
 
         # CNN pathway
         cnn_features = self.cnn(image)
