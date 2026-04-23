@@ -243,6 +243,26 @@ def main():
     ENT_COEF_START = 0.02
     ENT_COEF_FLOOR = 0.01
 
+    # BC-finetune hyperparameter override. When starting from a BC prior
+    # (URBANZERO_BC_WEIGHTS set), PPO needs radically smaller updates than
+    # from-scratch training or it will destabilize the prior via excessive
+    # approx_kl and clip_fraction. Observed: at lr=3e-4 / ent_coef=0.02
+    # on a BC model with std=0.22, approx_kl hit 0.079 (5x healthy), clip_
+    # fraction 0.34 (2x healthy). Roach (Zhang 2021 §3.2) uses lr=1e-5 for
+    # BC finetune; we use lr=1e-4 as a compromise for our 5M-step budget.
+    # ent_coef also cut: 0.005 start -> 0.001 floor stays within Andrychowicz
+    # 2021's viable band's lower edge (0.003-0.03), preserving BC's
+    # learned log_std rather than forcing wider exploration.
+    _is_bc_finetune = bool(os.environ.get("URBANZERO_BC_WEIGHTS", "").strip())
+    if _is_bc_finetune:
+        LR_BC_FINETUNE = 1e-4
+        ENT_COEF_START = 0.005
+        ENT_COEF_FLOOR = 0.001
+        print(f"  [BC-finetune] lr={LR_BC_FINETUNE}, "
+              f"ent_coef {ENT_COEF_START}->{ENT_COEF_FLOOR} (floor)")
+    else:
+        LR_BC_FINETUNE = 3e-4  # from-scratch default
+
     print(f"=== UrbanZero Training ===")
     print(f"  Envs: {args.n_envs}")
     print(f"  Timesteps: {args.timesteps:,}")
@@ -376,7 +396,7 @@ def main():
             # Override checkpoint's saved hyperparameters with current values.
             # Without this, PPO.load() silently uses the old LR/epochs from the
             # checkpoint, ignoring the tuned values above.
-            learning_rate=3e-4,
+            learning_rate=LR_BC_FINETUNE,
             n_epochs=3,
             ent_coef=ENT_COEF_START,
             clip_range=0.2,
@@ -396,7 +416,7 @@ def main():
                 device="cuda" if torch.cuda.is_available() else "cpu",
                 # Same hyperparameter override as the resume path — ensures
                 # PPO does not silently inherit stale values from the BC zip.
-                learning_rate=3e-4,
+                learning_rate=LR_BC_FINETUNE,
                 n_steps=n_steps,
                 batch_size=batch_size,
                 n_epochs=3,
@@ -415,9 +435,14 @@ def main():
             if os.path.exists(_bc_vecnorm_path):
                 # env is currently a VecNormalize wrapping VecFrameStack.
                 # We load the saved stats into it, preserving the env object.
+                # Guard each field with hasattr because training env uses
+                # norm_obs=False (reward-only VecNormalize) so obs_rms does
+                # not exist; copying blindly raises AttributeError at launch.
                 _vn_loaded = VecNormalize.load(_bc_vecnorm_path, env.venv)
-                env.obs_rms  = _vn_loaded.obs_rms
-                env.ret_rms  = _vn_loaded.ret_rms
+                if hasattr(env, "obs_rms") and hasattr(_vn_loaded, "obs_rms"):
+                    env.obs_rms = _vn_loaded.obs_rms
+                if hasattr(env, "ret_rms") and hasattr(_vn_loaded, "ret_rms"):
+                    env.ret_rms = _vn_loaded.ret_rms
                 env.training = True
                 print(f"[BC-warmstart] VecNormalize stats restored from {_bc_vecnorm_path}")
             else:
@@ -428,9 +453,10 @@ def main():
                 env,
                 verbose=1,
                 tensorboard_log=LOG_DIR,
-                learning_rate=3e-4,         # Schulman et al. 2017 PPO default;
-                                            # prior 5e-5 was a post-hoc stabilizer
-                                            # for a broken reward, no longer needed
+                learning_rate=LR_BC_FINETUNE,  # Schulman 2017 PPO default (3e-4)
+                                            # from scratch; lowered to 1e-4
+                                            # when BC warmstart is active (see
+                                            # LR_BC_FINETUNE definition above).
                 ent_coef=ENT_COEF_START,    # initialized high, annealed by callback
                 vf_coef=0.5,                # value function loss weight
                 max_grad_norm=0.5,          # gradient clipping

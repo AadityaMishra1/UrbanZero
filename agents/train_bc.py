@@ -33,7 +33,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader  # noqa: F401 — used via _BCFrameStackDataset
 
 # Ensure project root is importable before SB3 imports.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -106,6 +106,83 @@ class _DummyDrivingEnv(gym.Env):
 # -----------------------------------------------------------------------
 # Offline frame stacking
 # -----------------------------------------------------------------------
+
+def _compute_stack_indices(
+    N: int,
+    n_stack: int,
+    episode_starts: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute the (N, n_stack) int64 array of source indices for stacking.
+
+    Memory-efficient alternative to materializing the full stacked tensor —
+    at 100k frames × 4 stack × (128,128) float32 the stacked array is ~25 GB
+    and OOMs. Storing only the index map is ~3 MB; we materialize one batch
+    at a time in the DataLoader (see _BCFrameStackDataset below).
+
+    Returns:
+        stack_idx : (N, n_stack) int64. stack_idx[i, k] is the source
+                    frame index to use for stack position k of item i.
+                    k=0 is oldest, k=n_stack-1 is current.
+    """
+    stack_idx = np.zeros((N, n_stack), dtype=np.int64)
+
+    # Precompute episode-start index for each frame (same as before)
+    if episode_starts is not None:
+        assert len(episode_starts) == N, "episode_starts must match length"
+        ep_start_idx = np.zeros(N, dtype=np.int64)
+        last = 0
+        for i in range(N):
+            if episode_starts[i]:
+                last = i
+            ep_start_idx[i] = last
+    else:
+        ep_start_idx = None
+
+    for i in range(N):
+        lo = ep_start_idx[i] if ep_start_idx is not None else 0
+        for k in range(n_stack):
+            src_idx = i - (n_stack - 1 - k)
+            src_idx = max(src_idx, lo, 0)
+            stack_idx[i, k] = src_idx
+    return stack_idx
+
+
+class _BCFrameStackDataset:
+    """PyTorch-compatible dataset that lazily stacks frames per __getitem__.
+
+    Stores the raw (unstacked) buffers + a stack_idx map. Each __getitem__
+    materializes one stacked (n_stack, H, W) image + stacked state from
+    the source arrays — zero copy of the heavy image data into RAM beyond
+    the original buffer. Works with torch.utils.data.DataLoader.
+    """
+
+    def __init__(
+        self,
+        raw_images: np.ndarray,          # (N, 1, H, W) float32
+        raw_states: np.ndarray,          # (N, STATE_DIM) float32
+        raw_actions: np.ndarray,         # (N, 2) float32
+        stack_idx: np.ndarray,           # (N, n_stack) int64
+        n_stack: int,
+    ) -> None:
+        self.raw_images = raw_images
+        self.raw_states = raw_states
+        self.raw_actions = raw_actions
+        self.stack_idx = stack_idx
+        self.n_stack = n_stack
+        self.state_dim = raw_states.shape[1]
+
+    def __len__(self) -> int:
+        return len(self.raw_actions)
+
+    def __getitem__(self, i: int):
+        idxs = self.stack_idx[i]  # (n_stack,)
+        # Gather the stacked image: (n_stack, H, W)
+        img = self.raw_images[idxs, 0]  # fancy indexing strips channel-1 dim
+        # Gather the stacked state: (n_stack, STATE_DIM) then flatten
+        st = self.raw_states[idxs].reshape(self.n_stack * self.state_dim)
+        act = self.raw_actions[i]
+        return img, st, act
+
 
 def _stack_frames(
     images: np.ndarray,
@@ -307,22 +384,26 @@ def main() -> None:
     print(f"[BC-train] {N:,} frames loaded. Applying {args.n_stack}-frame stack ...")
 
     # ------------------------------------------------------------------
-    # 2. Offline frame stacking
+    # 2. Offline frame stacking (lazy — index map only, not the full tensor)
     # ------------------------------------------------------------------
-    images_stacked, states_stacked = _stack_frames(
-        raw_images, raw_states, args.n_stack, raw_episode_starts
+    # Materializing (N, n_stack, H, W) float32 up-front is N × 4 × 128 × 128 × 4
+    # bytes = ~262 KB per frame; at 100k frames that's 25 GB and OOMs most
+    # workstations. Use a lazy dataset that stores only the (N, n_stack) int64
+    # index map (~3 MB) and stacks per-item at DataLoader time.
+    stack_idx = _compute_stack_indices(N, args.n_stack, raw_episode_starts)
+    print(f"[BC-train] Stack index map: shape={stack_idx.shape}, "
+          f"dtype={stack_idx.dtype}  (lazy stacking, no full-tensor allocation)")
+    dataset = _BCFrameStackDataset(
+        raw_images=raw_images,
+        raw_states=raw_states,
+        raw_actions=raw_actions,
+        stack_idx=stack_idx,
+        n_stack=args.n_stack,
     )
-    # images_stacked : (N, n_stack, H, W)
-    # states_stacked : (N, STATE_DIM * n_stack)
-    print(f"[BC-train] Stacked shapes: images={images_stacked.shape}, "
-          f"states={states_stacked.shape}, actions={raw_actions.shape}")
-
-    # Convert to tensors
-    t_images  = torch.from_numpy(images_stacked).float()    # (N, n_stack, H, W)
-    t_states  = torch.from_numpy(states_stacked).float()    # (N, STATE_DIM*n_stack)
-    t_actions = torch.from_numpy(raw_actions).float()       # (N, 2)
-
-    dataset = TensorDataset(t_images, t_states, t_actions)
+    print(f"[BC-train] Dataset: N={len(dataset)} frames, "
+          f"image path (lazy-stacked): ({args.n_stack}, 128, 128), "
+          f"state path (lazy-flat): ({STATE_DIM * args.n_stack},), "
+          f"actions: {raw_actions.shape}")
     loader  = DataLoader(
         dataset,
         batch_size=args.batch_size,

@@ -40,7 +40,11 @@ LOG_DIR="$HOME_DIR/logs"
 
 mkdir -p "$CKPT_DIR" "$LOG_DIR"
 
-ACTIVATE="source '$VENV' && export PYTHONPATH=\$PYTHONPATH:'$CARLA_PYTHONAPI' && export URBANZERO_SEED='$SEED' && cd '$REPO'"
+# Forward URBANZERO_BC_WEIGHTS (BC warmstart path) through to the tmux
+# session. Without this, train.py never sees the env var and the BC
+# warmstart branch is skipped silently.
+BC_WEIGHTS="${URBANZERO_BC_WEIGHTS:-}"
+ACTIVATE="source '$VENV' && export PYTHONPATH=\$PYTHONPATH:'$CARLA_PYTHONAPI' && export URBANZERO_SEED='$SEED' && export URBANZERO_BC_WEIGHTS='$BC_WEIGHTS' && cd '$REPO'"
 
 # Parse args: first positional arg is an optional checkpoint path. Anything
 # else is passed verbatim to train.py (e.g. --no-traffic, --no-weather).
