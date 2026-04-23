@@ -54,14 +54,24 @@ def parse_args() -> argparse.Namespace:
                    help="Number of NPCs to spawn (default: 10)")
     p.add_argument("--ticks", type=int, default=60,
                    help="World ticks to run before measuring motion (default: 60 = 3s sim time)")
-    p.add_argument("--hybrid_physics", action="store_true", default=True,
-                   help="Enable TM hybrid physics mode (matches training env default)")
+    p.add_argument("--hybrid_physics", action="store_true", default=False,
+                   help="Enable TM hybrid physics mode. Default OFF — issue #12 "
+                        "showed NPCs frozen even solo, and hybrid_physics requires "
+                        "a hero vehicle within radius or all NPCs go dormant.")
     p.add_argument("--speed_diff", type=float, default=-30.0,
                    help="Global percentage speed difference (-30 = drive 30%% over limit)")
     p.add_argument("--no_sync", action="store_true",
                    help="Skip sync mode (for comparing async vs sync behavior)")
     p.add_argument("--verbose", action="store_true",
                    help="Per-NPC position/velocity logging")
+    p.add_argument("--spawn_ego", action="store_true", default=False,
+                   help="Spawn an idle ego vehicle before NPCs. Hybrid physics "
+                        "requires a hero — without one, ALL NPCs fall into "
+                        "dormant state regardless of radius.")
+    p.add_argument("--load_map", type=str, default=None,
+                   help="If set, force-load this map before the test (e.g. Town01). "
+                        "The issue #12 report speculated about Town10HD_Opt being "
+                        "the default; load_world('Town01') rules that out.")
     return p.parse_args()
 
 
@@ -85,9 +95,21 @@ def main() -> int:
     try:
         client = carla.Client(args.host, args.port)
         client.set_timeout(10.0)
-        world = client.get_world()
+        if args.load_map:
+            print(f"[sanity] loading map '{args.load_map}' (this takes 5-10s) ...")
+            world = client.load_world(args.load_map)
+        else:
+            world = client.get_world()
         settings_initial = world.get_settings()
-        print(f"[sanity] connected. world.sync (initial) = {settings_initial.synchronous_mode}")
+        # Map-name print per issue #12 lead. The CARLA 0.9.15 default is
+        # Town10HD_Opt; if we've been running there all along, TM path
+        # generation might be the missing piece.
+        try:
+            map_name = world.get_map().name
+        except Exception:
+            map_name = "?"
+        print(f"[sanity] connected. map='{map_name}'  "
+              f"world.sync (initial) = {settings_initial.synchronous_mode}")
     except Exception as e:
         print(f"[sanity] FAILED to connect: {e}", file=sys.stderr)
         return 2
@@ -126,6 +148,24 @@ def main() -> int:
         bps = [bp for bp in bps if int(bp.get_attribute("number_of_wheels")) >= 4]
         spawn_points = world.get_map().get_spawn_points()
         random.shuffle(spawn_points)
+
+        # Optional ego vehicle spawn (issue #12 hypothesis).
+        # TM's hybrid_physics_mode puts NPCs outside the hero's radius into a
+        # dormant state. With no hero, ALL NPCs are dormant regardless of
+        # radius. The training env has an ego; the original sanity check
+        # didn't. Spawn a stationary ego at the first spawn point to test.
+        ego = None
+        if args.spawn_ego and spawn_points:
+            try:
+                ego_bp = random.choice(bps)
+                ego = world.spawn_actor(ego_bp, spawn_points[0])
+                spawn_points = spawn_points[1:]  # reserved for ego
+                print(f"[sanity] spawned idle ego id={ego.id} "
+                      f"at ({spawn_points[0].location.x:.1f},"
+                      f"{spawn_points[0].location.y:.1f}) "
+                      f"(hero for hybrid_physics radius check)")
+            except Exception as e:
+                print(f"[sanity] ego spawn failed: {e}")
 
         npcs = []
         for sp in spawn_points:
@@ -244,14 +284,23 @@ def main() -> int:
             exit_code = 2
 
     finally:
-        # Cleanup
+        # Cleanup. Issue #12 note: sequential set_autopilot(False) + destroy()
+        # on the same actor can cause a C++ abort on "destroyed actor". Use
+        # batch destroy via client.apply_batch_sync to avoid the race.
         print("\n[sanity] cleaning up ...")
-        for npc in npcs:
-            try:
-                npc.set_autopilot(False)
-                npc.destroy()
-            except Exception:
-                pass
+        try:
+            cmds = [carla.command.DestroyActor(a.id) for a in npcs]
+            if ego is not None:
+                cmds.append(carla.command.DestroyActor(ego.id))
+            if cmds:
+                client.apply_batch_sync(cmds, False)
+        except Exception:
+            # Fallback: best-effort per-actor destroy
+            for actor in list(npcs) + ([ego] if ego else []):
+                try:
+                    actor.destroy()
+                except Exception:
+                    pass
         # Restore async mode so the CARLA server is usable for other tests
         try:
             settings = world.get_settings()
