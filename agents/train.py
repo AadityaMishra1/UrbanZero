@@ -383,35 +383,75 @@ def main():
             max_grad_norm=0.5,
         )
     else:
-        model = PPO(
-            ClampedStdPolicy,
-            env,
-            verbose=1,
-            tensorboard_log=LOG_DIR,
-            learning_rate=3e-4,         # Schulman et al. 2017 PPO default;
-                                        # prior 5e-5 was a post-hoc stabilizer
-                                        # for a broken reward, no longer needed
-            ent_coef=ENT_COEF_START,    # initialized high, annealed by callback
-            vf_coef=0.5,                # value function loss weight
-            max_grad_norm=0.5,          # gradient clipping
-            n_steps=n_steps,            # rollout length per env
-            batch_size=batch_size,      # mini-batch size
-            n_epochs=3,                 # Compromise between prior 2 (proven
-                                        # at 7M steps without deadlock) and
-                                        # the PPO-default 10. Going to 4 in
-                                        # v2 doubled the tick-gap between
-                                        # rollouts and triggered CARLA issue
-                                        # #9172 (TrafficManagerLocal race) —
-                                        # see GitHub issue #4 root-cause.
-                                        # 3 keeps the gap close to the 7M
-                                        # run's proven-safe cadence while
-                                        # giving slightly more gradient use.
-            gamma=0.99,                 # discount factor
-            gae_lambda=0.95,            # GAE lambda
-            clip_range=0.2,             # standard PPO clip range
-            policy_kwargs=policy_kwargs,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
+        # BC warmstart path — only activates when URBANZERO_BC_WEIGHTS is set
+        # AND no --resume checkpoint was supplied (i.e., this is a fresh start
+        # that wants a BC prior).  If --resume is set, that always wins.
+        _bc_weights = os.environ.get("URBANZERO_BC_WEIGHTS", "").strip()
+        if _bc_weights:
+            _bc_weights = os.path.expanduser(_bc_weights)
+            print(f"[BC-warmstart] loading weights from {_bc_weights}")
+            model = PPO.load(
+                _bc_weights,
+                env=env,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                # Same hyperparameter override as the resume path — ensures
+                # PPO does not silently inherit stale values from the BC zip.
+                learning_rate=3e-4,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                n_epochs=3,
+                gamma=0.99,
+                gae_lambda=0.95,
+                ent_coef=ENT_COEF_START,
+                vf_coef=0.5,
+                clip_range=0.2,
+                max_grad_norm=0.5,
+            )
+            # Attempt to load sibling VecNormalize stats.  The BC trainer
+            # saves identity stats (no real rollouts), so this is mainly
+            # for structural completeness; reward normalization will adapt
+            # quickly from real rollouts.
+            _bc_vecnorm_path = _bc_weights.replace(".zip", "") + "_vecnormalize.pkl"
+            if os.path.exists(_bc_vecnorm_path):
+                # env is currently a VecNormalize wrapping VecFrameStack.
+                # We load the saved stats into it, preserving the env object.
+                _vn_loaded = VecNormalize.load(_bc_vecnorm_path, env.venv)
+                env.obs_rms  = _vn_loaded.obs_rms
+                env.ret_rms  = _vn_loaded.ret_rms
+                env.training = True
+                print(f"[BC-warmstart] VecNormalize stats restored from {_bc_vecnorm_path}")
+            else:
+                print(f"[BC-warmstart] {_bc_vecnorm_path} not found — using initial stats")
+        else:
+            model = PPO(
+                ClampedStdPolicy,
+                env,
+                verbose=1,
+                tensorboard_log=LOG_DIR,
+                learning_rate=3e-4,         # Schulman et al. 2017 PPO default;
+                                            # prior 5e-5 was a post-hoc stabilizer
+                                            # for a broken reward, no longer needed
+                ent_coef=ENT_COEF_START,    # initialized high, annealed by callback
+                vf_coef=0.5,                # value function loss weight
+                max_grad_norm=0.5,          # gradient clipping
+                n_steps=n_steps,            # rollout length per env
+                batch_size=batch_size,      # mini-batch size
+                n_epochs=3,                 # Compromise between prior 2 (proven
+                                            # at 7M steps without deadlock) and
+                                            # the PPO-default 10. Going to 4 in
+                                            # v2 doubled the tick-gap between
+                                            # rollouts and triggered CARLA issue
+                                            # #9172 (TrafficManagerLocal race) —
+                                            # see GitHub issue #4 root-cause.
+                                            # 3 keeps the gap close to the 7M
+                                            # run's proven-safe cadence while
+                                            # giving slightly more gradient use.
+                gamma=0.99,                 # discount factor
+                gae_lambda=0.95,            # GAE lambda
+                clip_range=0.2,             # standard PPO clip range
+                policy_kwargs=policy_kwargs,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
 
     print(f"Device: {model.device}")
     print(f"Policy architecture:\n{model.policy}")

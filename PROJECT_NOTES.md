@@ -771,3 +771,83 @@ Append here when something changes materially.
   run, pull this tip, archive collapsed artifacts
   (`v2_rl.flatrc-<ts>`), fresh weights, seed 211 (different from 42
   and 137), T+15min sanity check with std threshold.
+
+- **2026-04-23 ~01:30 BC pipeline landed**. Files:
+  `scripts/collect_bc_data.py` (BehaviorAgent rollout with σ=0.1 rad
+  steering noise per Ross/Bagnell 2010), `agents/train_bc.py`
+  (Gaussian NLL trainer matching `ClampedStdPolicy` + `DrivingCNN`
+  architecture exactly, saves SB3-compatible .zip + sibling
+  `_vecnormalize.pkl`), `scripts/run_bc_pipeline.sh` (sequential
+  runner), `agents/train.py` patch adding `URBANZERO_BC_WEIGHTS` env
+  var path via `PPO.load()` with sibling vecnorm stitch. This is
+  **Agent-1 red-team's minimal-BC fallback**: skips KL-to-BC
+  penalty and skips MC-return value-head bootstrap — both deferred.
+  Minimal-BC is 12-16h dev (now done) + ~4-8h data collection + BC
+  train + PPO finetune. Fits deadline as a fallback path triggered
+  at T+1h if fix-2 rolling RC < 8%.
+
+- **2026-04-23 ~01:30 failure-mode stress test**. Spawned a third
+  red-team subagent to specifically answer "will observed failures
+  recur, and can the agent learn to drive." Findings:
+  - **DEAD (mechanistic, cannot recur)**: F1 perpendicular-circling
+    (no signed-cos in code), F3 stagnation-counter twitch-game
+    (replaced with cumulative-progress anchor), F5 overspeed hack
+    (progress cap at TARGET not 1.5m), F6 peak-then-regress
+    (RollingBestCallback active), F8 terminal invisible (ratio
+    inverted), F11 cos-similarity heading (rejected, not in code),
+    F13 SubprocVecEnv BrokenPipe (DummyVecEnv eliminates IPC).
+  - **LOW risk (probabilistic, strong mitigation)**: F2 sit-still
+    global optimum (idle_cost inverts per-step cost), F4 1.01 m/s
+    hover attractor (continuous ramp + persistent carrot), F7
+    entropy collapse (ent_coef 0.01 floor), F9 sit-still local
+    optimum at 233k (idle_cost -0.15 makes stall -0.183/step),
+    F12 NPCs frozen (hybrid_physics + diagnostic).
+  - **MEDIUM risk (remaining concern)**: F10 std-pinned / sparse
+    steering gradient. The `log_std ≤ log(0.7)` clamp guard is
+    mechanistic. The steering-gradient guard is probabilistic:
+    potential shaping gives ~0.005/step per m of lateral motion,
+    which integrates to useful signal over many episodes but is
+    marginal per-step vs std=0.6 steer noise.
+  - **Mechanistic driving argument**: (L1) forward-motion gradient
+    is real — `throttle_brake + 0.3` idle-creep (bias toward
+    throttle>0) + idle_cost negative gradient at speed=0 +
+    progress_reward positive gradient at speed>0. (L2) lateral-
+    motion gradient from potential shaping is weak-but-present
+    (+0.0046/step per 1m lateral). (L3) γ=0.99 horizon is 100 steps;
+    dense shaping accumulates to ~4.7 reward per horizon, large
+    enough for value-function learning. (L5) no new attractors from
+    shaping: constant-radius orbits get 0 from Φ but hit REALLY_STUCK
+    terminal; backward motion gives 0 progress; terminal-Φ exploit
+    bounded at |Φ_max|=0.9 which never overcomes ±50 terminal.
+
+- **Verdict from the stress test**: p(rolling RC > 15% by 5M steps
+  under fix-2 pure RL) ≈ **0.35**. With BC fallback bringing another
+  ~0.35, combined p(ship something demoable) ≈ 0.60-0.65. The
+  single make-or-break reward signal is the `throttle_brake + 0.3`
+  action-shift (creates motion in the first place); the highest-
+  leverage reward term is idle_cost (inverts sit-still ordering).
+
+- **Mechanical gap named by stress test (not acted on pre-launch)**:
+  the reviewer suggested adding `+α · route_progress` to Φ to
+  strengthen forward-along-route gradient. Rejected because that
+  term telescopes to approximately `α · γ · Δroute_progress` per
+  step — the same shape as progress_reward. Mathematically
+  equivalent to increasing progress_reward coefficient from 0.05.
+  If fix-2 T+1h RC < 8% we'll bump `progress_reward` 0.05→0.10 AND
+  trigger BC fallback in parallel rather than adding redundant
+  shaping terms.
+
+- **BC collector bugfix**: reviewer caught missing episode-boundary
+  markers in the collected .npz, which would have contaminated the
+  first 3 frames of each episode (~3% of dataset at 100-step eps)
+  via cross-episode frame-stacking. Added `episode_starts` bool
+  array to the .npz and taught `train_bc.py::_stack_frames` to
+  refuse crossing episode boundaries. BC trainer also falls back
+  gracefully to legacy behavior if loading an older .npz without
+  the marker.
+
+- **PC-side launch remains fix-2 as pushed (`ff7a1e1`)**. BC pipeline
+  is prepared but not executed. Triggering criteria: rolling RC < 8%
+  at fix-2 timestep ~700k (T+1h 40min). If triggered, remote Claude
+  writes the BC paste-block; PC-side runs
+  `scripts/run_bc_pipeline.sh --n_frames 150000 --epochs 30`.
