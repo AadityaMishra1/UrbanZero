@@ -205,6 +205,7 @@ class CarlaEnv(gym.Env):
     def _reset_once(self, seed=None, options=None):
         self._destroy_actors()
         self.collision_history = []
+        self._max_collision_force = 0.0  # reset for new episode (v5 smooth penalty)
         self.image = None
         self.step_count = 0
         self.prev_action = np.array([0.0, 0.0], dtype=np.float32)
@@ -355,6 +356,10 @@ class CarlaEnv(gym.Env):
         # Only count collisions with significant force. Threshold 2000
         # filters curb scrapes, pole brushes, and minor NPC contacts
         # that were killing good driving episodes prematurely.
+        # Also track the max force so the reward can scale the terminal
+        # penalty by severity (v5 per external reviewer: smoother gradient
+        # than flat -50).
+        self._max_collision_force = 0.0
         def _on_collision(event):
             impulse = event.normal_impulse
             force = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
@@ -363,6 +368,8 @@ class CarlaEnv(gym.Env):
             # The previous threshold killed honest driving on tight turns.
             if force > 2500.0:
                 self.collision_history.append(event)
+                if force > self._max_collision_force:
+                    self._max_collision_force = float(force)
         self.collision_sensor.listen(_on_collision)
 
         # Wait for first image BEFORE spawning traffic — if traffic spawns
@@ -466,6 +473,31 @@ class CarlaEnv(gym.Env):
         obs = self._get_obs()
         reward, terminated = self._compute_reward(action)
         self.prev_action = np.array([steer, throttle_brake], dtype=np.float32)
+
+        # NPC motion diagnostic (v5). Every 500 sim steps (~25s), compute
+        # the average speed of spawned NPCs. If it's < 0.1 m/s, NPCs are
+        # frozen — the training env is not actually dynamic, and the
+        # collision signal is contaminated per the external reviewer's
+        # diagnosis. Prints so PC-side can confirm from the log without
+        # eyeballing CARLA windows.
+        if self.step_count % 500 == 0 and getattr(self, "traffic_actors", None):
+            try:
+                speeds = []
+                for npc in self.traffic_actors[:10]:  # sample first 10
+                    v = npc.get_velocity()
+                    speeds.append(math.sqrt(v.x * v.x + v.y * v.y))
+                if speeds:
+                    avg_npc_speed = sum(speeds) / len(speeds)
+                    max_npc_speed = max(speeds)
+                    status = "MOVING" if avg_npc_speed > 0.1 else "FROZEN"
+                    print(f"[NPC-diagnostic] step={self.step_count} "
+                          f"n_sampled={len(speeds)} "
+                          f"avg_speed={avg_npc_speed:.2f}m/s "
+                          f"max_speed={max_npc_speed:.2f}m/s "
+                          f"status={status}")
+            except Exception as e:
+                # Silent fail — diagnostics must never block training.
+                pass
 
         truncated = self.step_count >= self.max_episode_steps
 
@@ -826,9 +858,23 @@ class CarlaEnv(gym.Env):
             self._significant_progress_anchor = self.route_progress
             self._last_significant_progress_step = self.step_count
 
-        # Terminal: collision
+        # Terminal: collision — smooth penalty scaled by impulse magnitude
+        # (v5 per external reviewer). Binary -50 gave the same penalty for
+        # a curb scrape as a head-on crash, producing a noisy terminal
+        # signal. Scaling by max_force/100 gives the critic a continuous
+        # signal: small collisions get -25, typical crashes get -50, hard
+        # crashes clamp at -100 via defensive clip. Coefficient is
+        # configurable per-worker via URBANZERO_COLLISION_COEF (default 0.01
+        # = 1/100; set to 0.02 to scale harder). Set to 0 to fall back to
+        # flat -50 behavior.
         if len(self.collision_history) > 0:
-            reward = -50.0
+            collision_coef = float(
+                os.environ.get("URBANZERO_COLLISION_COEF", "0.01")
+            )
+            if collision_coef > 0:
+                reward = -max(25.0, min(100.0, collision_coef * self._max_collision_force))
+            else:
+                reward = -50.0
             terminated = True
             termination_reason = "COLLISION"
 

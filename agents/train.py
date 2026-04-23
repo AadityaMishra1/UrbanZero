@@ -274,20 +274,24 @@ def main():
         #   PPO hparams: keep v3's lr=1e-4, n_epochs=1, clip_range=0.1
         #   as additional safety; these aren't the root cause but they
         #   don't hurt.
-        LR_BC_FINETUNE = 1e-4
-        ENT_COEF_START = 1e-4     # was 0.005: near-zero, BC prior supplies
-        ENT_COEF_FLOOR = 1e-4     # was 0.001: constant, no schedule
+        # v5 hyperparameters from external reviewer's corrections:
+        #   lr=5e-5 (v4 was 1e-4; reviewer: "nudge, not overwrite the BC policy")
+        #   ent_coef=1e-3 constant (v4 was 1e-4; reviewer recommends 0.001 floor)
+        #   batch_size handled at PPO construction (increased from 64 to 128)
+        LR_BC_FINETUNE = 5e-5
+        ENT_COEF_START = 1e-3
+        ENT_COEF_FLOOR = 1e-3
         N_EPOCHS_BC = 1
         CLIP_RANGE_BC = 0.1
-        WIDEN_LOG_STD_TO = None   # revert v3's -0.69 widening — BC's σ=0.22
-                                   # is fine once reward doesn't fight it
-        print(f"  [BC-finetune v4] lr={LR_BC_FINETUNE}, n_epochs={N_EPOCHS_BC}, "
+        WIDEN_LOG_STD_TO = None   # BC's σ=0.22 is fine once reward doesn't fight it
+        print(f"  [BC-finetune v5] lr={LR_BC_FINETUNE}, n_epochs={N_EPOCHS_BC}, "
               f"clip_range={CLIP_RANGE_BC}, "
               f"ent_coef={ENT_COEF_START} (constant, no schedule), "
               f"widen_log_std={'disabled' if WIDEN_LOG_STD_TO is None else WIDEN_LOG_STD_TO}")
-        print(f"  [BC-finetune v4] IMPORTANT: requires env vars at launch:")
+        print(f"  [BC-finetune v5] IMPORTANT: requires env vars at launch:")
         print(f"                   URBANZERO_IDLE_COST_COEF=0")
         print(f"                   URBANZERO_REALLY_STUCK_STEPS=3000")
+        print(f"                   URBANZERO_COLLISION_COEF=0.01  (smooth collision)")
     else:
         LR_BC_FINETUNE = 3e-4  # from-scratch default
         N_EPOCHS_BC = 3
@@ -416,7 +420,12 @@ def main():
 
     # Scale batch parameters with number of envs
     n_steps = 512 if args.n_envs <= 2 else 256
-    batch_size = 64 * args.n_envs  # scale with envs
+    # v5 per external reviewer: "Small batches in CARLA lead to high variance
+    # gradients." Increase BC-finetune batch size to 128 (pure-RL unchanged).
+    if _is_bc_finetune:
+        batch_size = 128
+    else:
+        batch_size = 64 * args.n_envs  # scale with envs
 
     if args.resume:
         print(f"Resuming from: {args.resume}")
