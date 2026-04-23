@@ -255,29 +255,39 @@ def main():
     # learned log_std rather than forcing wider exploration.
     _is_bc_finetune = bool(os.environ.get("URBANZERO_BC_WEIGHTS", "").strip())
     if _is_bc_finetune:
-        # H2+H3+H4 fix (Issue #7): the lr reduction alone failed to tame
-        # KL because the dominant variable is σ, not lr. BC converged to
-        # std=0.22; PPO's log-prob ratio scales as 1/σ² so gradients at
-        # σ=0.22 are ~20x larger than at σ=1.0. n_epochs=3 compounded
-        # the amplified updates; clip_range=0.2 was too wide for the
-        # ratio at that σ. Three-axis fix keeps BC's mean network intact
-        # while making PPO's update step PPO-robust:
-        #   (H2) widen log_std at warmstart load to log(0.5)=-0.69 —
-        #        Andrychowicz 2021 §4.5 viable band [0.3, 0.7]; keeps
-        #        the good actor network, loosens over-confident variance.
-        #   (H3) n_epochs 3 → 1 (Roach 2021 §3.2 single-epoch finetune)
-        #   (H4) clip_range 0.2 → 0.1 (Schulman 2017 §6.1, "careful
-        #        finetune" value standard in BC→PPO pipelines)
+        # v4 diagnosis (after v1/v2/v3 all failed): the core issue wasn't
+        # σ-amplification (v3 fixed that — KL looked perfect). The issue is
+        # that our REWARD was designed for pure-RL to break the sit-still
+        # attractor. It has idle_cost=-0.15/step that actively PUNISHES
+        # BC's expert behavior (stopping at red lights, slowing behind
+        # traffic). PPO pushes the policy AWAY from what BC taught; the
+        # entropy bonus compounds by widening σ until the policy is random.
+        #
+        # v4 fix is to make the REWARD BC-compatible (not PPO-hyperparams):
+        #   env side (via URBANZERO_IDLE_COST_COEF=0 + REALLY_STUCK_STEPS=
+        #   3000): stop punishing correct stopping; BC prior prevents the
+        #   sit-still attractor on its own.
+        #   policy side: keep BC's tight σ=0.22 (revert v3's widening);
+        #   drop ent_coef to near-zero so entropy bonus doesn't drift σ
+        #   upward. With BC-compatible reward, gradients are small and
+        #   directional, so tight σ is fine.
+        #   PPO hparams: keep v3's lr=1e-4, n_epochs=1, clip_range=0.1
+        #   as additional safety; these aren't the root cause but they
+        #   don't hurt.
         LR_BC_FINETUNE = 1e-4
-        ENT_COEF_START = 0.005
-        ENT_COEF_FLOOR = 0.001
+        ENT_COEF_START = 1e-4     # was 0.005: near-zero, BC prior supplies
+        ENT_COEF_FLOOR = 1e-4     # was 0.001: constant, no schedule
         N_EPOCHS_BC = 1
         CLIP_RANGE_BC = 0.1
-        WIDEN_LOG_STD_TO = -0.69  # log(0.5); std 0.22 → 0.50
-        print(f"  [BC-finetune] lr={LR_BC_FINETUNE}, n_epochs={N_EPOCHS_BC}, "
+        WIDEN_LOG_STD_TO = None   # revert v3's -0.69 widening — BC's σ=0.22
+                                   # is fine once reward doesn't fight it
+        print(f"  [BC-finetune v4] lr={LR_BC_FINETUNE}, n_epochs={N_EPOCHS_BC}, "
               f"clip_range={CLIP_RANGE_BC}, "
-              f"ent_coef {ENT_COEF_START}->{ENT_COEF_FLOOR} (floor), "
-              f"widen_log_std={WIDEN_LOG_STD_TO}")
+              f"ent_coef={ENT_COEF_START} (constant, no schedule), "
+              f"widen_log_std={'disabled' if WIDEN_LOG_STD_TO is None else WIDEN_LOG_STD_TO}")
+        print(f"  [BC-finetune v4] IMPORTANT: requires env vars at launch:")
+        print(f"                   URBANZERO_IDLE_COST_COEF=0")
+        print(f"                   URBANZERO_REALLY_STUCK_STEPS=3000")
     else:
         LR_BC_FINETUNE = 3e-4  # from-scratch default
         N_EPOCHS_BC = 3

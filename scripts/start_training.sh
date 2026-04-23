@@ -40,11 +40,14 @@ LOG_DIR="$HOME_DIR/logs"
 
 mkdir -p "$CKPT_DIR" "$LOG_DIR"
 
-# Forward URBANZERO_BC_WEIGHTS (BC warmstart path) through to the tmux
-# session. Without this, train.py never sees the env var and the BC
-# warmstart branch is skipped silently.
+# Forward URBANZERO_BC_WEIGHTS (BC warmstart path) and the BC-compatible
+# reward knobs (v4) through to the tmux session. Without these exports
+# train.py / CarlaEnv never see the env vars and the BC-compatible
+# reward profile is silently skipped.
 BC_WEIGHTS="${URBANZERO_BC_WEIGHTS:-}"
-ACTIVATE="source '$VENV' && export PYTHONPATH=\$PYTHONPATH:'$CARLA_PYTHONAPI' && export URBANZERO_SEED='$SEED' && export URBANZERO_BC_WEIGHTS='$BC_WEIGHTS' && cd '$REPO'"
+IDLE_COEF="${URBANZERO_IDLE_COST_COEF:-}"
+STUCK_STEPS="${URBANZERO_REALLY_STUCK_STEPS:-}"
+ACTIVATE="source '$VENV' && export PYTHONPATH=\$PYTHONPATH:'$CARLA_PYTHONAPI' && export URBANZERO_SEED='$SEED' && export URBANZERO_BC_WEIGHTS='$BC_WEIGHTS' && export URBANZERO_IDLE_COST_COEF='$IDLE_COEF' && export URBANZERO_REALLY_STUCK_STEPS='$STUCK_STEPS' && cd '$REPO'"
 
 # Parse args: first positional arg is an optional checkpoint path. Anything
 # else is passed verbatim to train.py (e.g. --no-traffic, --no-weather).

@@ -161,6 +161,21 @@ class CarlaEnv(gym.Env):
                   f"{self.CARROT_DECAY_STEPS_DEFAULT}")
             self._carrot_decay_steps = self.CARROT_DECAY_STEPS_DEFAULT
 
+        # BC-compatible reward knobs. Defaults reproduce the pure-RL reward
+        # that successfully broke the sit-still attractor. BC+PPO finetune
+        # sets these to disable idle_cost and loosen REALLY_STUCK because
+        # BC's expert already handles correct stopping (red lights, dense
+        # traffic) and punishing those behaviors actively destroys the BC
+        # prior during PPO finetune — observed across runs v1/v2/v3.
+        self._idle_cost_coef = float(
+            os.environ.get("URBANZERO_IDLE_COST_COEF", "-0.15")
+        )
+        self._really_stuck_steps = int(
+            os.environ.get("URBANZERO_REALLY_STUCK_STEPS", "1500")
+        )
+        print(f"[CarlaEnv] reward knobs: idle_cost_coef={self._idle_cost_coef}, "
+              f"really_stuck_steps={self._really_stuck_steps}")
+
         # Termination-reason emitter: _compute_reward writes the last
         # terminal's reason string here, step() reads it into info.
         self._last_termination_reason = None
@@ -795,7 +810,12 @@ class CarlaEnv(gym.Env):
         # -0.15/step at speed=0 makes the 1500-step REALLY_STUCK trajectory
         # ~-275 total, >5x worse per step than a 300-step crash. See header
         # for the full per-step cost comparison that motivates -0.15.
-        idle_cost = -0.15 * max(0.0, 1.0 - speed / 1.0)
+        # Coefficient is configurable per-worker via URBANZERO_IDLE_COST_COEF
+        # env var (default -0.15). BC+PPO finetune sets this to 0.0 because
+        # BC's expert prior already handles correct stopping (red lights,
+        # dense traffic); punishing those behaviors actively destroys the
+        # BC prior during PPO finetune.
+        idle_cost = self._idle_cost_coef * max(0.0, 1.0 - speed / 1.0)
 
         reward = progress_reward + carrot + idle_cost
         terminated = False
@@ -863,12 +883,14 @@ class CarlaEnv(gym.Env):
         # traffic with no legal escape) will trigger this under the new
         # reward, because the pure-progress signal gives no reason to stop.
         if (not terminated
-                and self.step_count - self._last_significant_progress_step > 1500):
+                and self.step_count - self._last_significant_progress_step >
+                self._really_stuck_steps):
             reward = -50.0
             terminated = True
             termination_reason = "REALLY_STUCK"
             print(f"[EPISODE END] reason=REALLY_STUCK "
-                  f"steps_since_progress={self.step_count - self._last_significant_progress_step}")
+                  f"steps_since_progress={self.step_count - self._last_significant_progress_step} "
+                  f"threshold={self._really_stuck_steps}")
 
         # Potential-based shaping (Ng/Harada/Russell 1999). Added AFTER the
         # terminal decision so we can use the episodic convention
