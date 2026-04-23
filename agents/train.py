@@ -359,7 +359,7 @@ def main():
             # Without this, PPO.load() silently uses the old LR/epochs from the
             # checkpoint, ignoring the tuned values above.
             learning_rate=3e-4,
-            n_epochs=4,
+            n_epochs=3,
             ent_coef=ENT_COEF_START,
             clip_range=0.2,
             max_grad_norm=0.5,
@@ -378,8 +378,16 @@ def main():
             max_grad_norm=0.5,          # gradient clipping
             n_steps=n_steps,            # rollout length per env
             batch_size=batch_size,      # mini-batch size
-            n_epochs=4,                 # PPO default; fewer epochs meant
-                                        # less gradient per rollout
+            n_epochs=3,                 # Compromise between prior 2 (proven
+                                        # at 7M steps without deadlock) and
+                                        # the PPO-default 10. Going to 4 in
+                                        # v2 doubled the tick-gap between
+                                        # rollouts and triggered CARLA issue
+                                        # #9172 (TrafficManagerLocal race) —
+                                        # see GitHub issue #4 root-cause.
+                                        # 3 keeps the gap close to the 7M
+                                        # run's proven-safe cadence while
+                                        # giving slightly more gradient use.
             gamma=0.99,                 # discount factor
             gae_lambda=0.95,            # GAE lambda
             clip_range=0.2,             # standard PPO clip range

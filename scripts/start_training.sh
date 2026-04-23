@@ -113,13 +113,21 @@ tmux new-session -d -s urbanzero -x 200 -y 50
 tmux send-keys -t urbanzero:0.0 \
   "$ACTIVATE && python3 -u agents/train.py --experiment '$EXPERIMENT' --n-envs '$N_ENVS' --base-port '$BASE_PORT' --timesteps '$TIMESTEPS' $RESUME $EXTRA_ARGS 2>&1 | tee '$LOG_DIR/train_${TS}.log'" Enter
 
-# Spectator runs in its own session — start only if not already running.
-if ! tmux has-session -t spectator 2>/dev/null; then
-    sleep 5
-    tmux new-session -d -s spectator -x 80 -y 20
-    tmux send-keys -t spectator "$ACTIVATE && python3 scripts/spectator.py" Enter
+# Spectator is now inline per-worker inside env/carla_env.py's step() —
+# each CARLA server window automatically follows its own worker's ego, so
+# you see N views (one per env). The external scripts/spectator.py was
+# removed from the auto-launch because it was a secondary client on port
+# 2000 and contributed to the multi-client sync-mode deadlock (CARLA
+# issues #1996 / #2239 / #9172, repo GitHub issue #4).
+# If you want to run the external spectator manually for debugging, it
+# now accepts URBANZERO_SPECTATOR_PORT — but expect it to re-introduce
+# the deadlock risk. Prefer the inline spectator.
+if tmux has-session -t spectator 2>/dev/null; then
+    echo "Warning: detected running 'spectator' tmux session from a prior"
+    echo "run. Kill it to avoid a secondary-client deadlock:"
+    echo "  tmux kill-session -t spectator"
 fi
 
-echo "Training in tmux 'urbanzero', spectator in tmux 'spectator'"
+echo "Training in tmux 'urbanzero'. Each CARLA window tracks its own ego."
 echo "Log: $LOG_DIR/train_${TS}.log"
 echo "Beacon: $HOME_DIR/beacon.json   (watch with: watch -n 5 'cat $HOME_DIR/beacon.json')"
