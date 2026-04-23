@@ -9,23 +9,34 @@ New design (backed by Andrychowicz et al. 2021 "What Matters in On-Policy
 Reinforcement Learning", ICLR):
   - no lower bound — let ent_coef (with a floor value, not annealed to
     zero) maintain exploration via its entropy-bonus gradient.
-  - soft upper bound log_std <= 0.0 (std <= 1.0). Prevents runaway
-    log_std -> +inf (policy becomes uniform noise). This is a safety
-    cap, not a target; healthy exploration sits well below it.
+  - soft upper bound log_std <= log(0.7) ≈ -0.357 (std <= 0.7). The
+    first value here was log(1.0) = 0.0; the 2026-04-22 run with the
+    idle_cost fix saturated log_std at that cap for 1500+ episodes
+    (std = 0.999 pinned), the policy became pure noise, and rolling
+    RC flatlined at 5-6% across 1500 episodes with zero trend. That is
+    an exploration pathology, not a gradient problem: at std=1.0 every
+    episode is a different random walk and the critic cannot assign
+    credit for any action. Andrychowicz 2021 §4.5 identifies std in
+    [0.3, 0.7] as the viable band for continuous control from scratch;
+    capping at 0.7 keeps exploration pressure high without letting the
+    entropy bonus drive the policy past the usable band. Lower floor
+    remains unbounded and controlled by ent_coef's gradient only.
 """
 
 from stable_baselines3.common.policies import ActorCriticPolicy
+import math
 
 
 class ClampedStdPolicy(ActorCriticPolicy):
-    """PPO policy with a soft upper bound on log_std (std <= 1.0).
+    """PPO policy with a soft upper bound on log_std (std <= 0.7).
 
     Works with any continuous DiagGaussian action space; the clamp is
     applied in-place before every forward/evaluate/distribution call so
     the optimizer cannot push log_std past the cap between updates.
     """
 
-    LOG_STD_MAX = 0.0  # std <= exp(0.0) = 1.0
+    # log(0.7) ≈ -0.35667 → std ≤ 0.7 (Andrychowicz 2021 §4.5 viable band)
+    LOG_STD_MAX = math.log(0.7)
 
     def _clamp(self):
         # Only cap from above. Lower bound deliberately left unbounded

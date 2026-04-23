@@ -212,6 +212,11 @@ class CarlaEnv(gym.Env):
         # of per-step rate.
         self._last_significant_progress_step = 0
         self._significant_progress_anchor = 0.0
+        # Potential-based shaping baseline. Initialized to 0.0 here; the
+        # true baseline is set at the end of reset() after the route
+        # and vehicle exist, so the first step's F = γ·Φ(s') - Φ(s_0)
+        # correctly compares against a real spawn-point potential.
+        self._prev_potential = 0.0
 
         # Weather randomization
         if self.enable_weather_randomization:
@@ -376,6 +381,11 @@ class CarlaEnv(gym.Env):
         # Spawn traffic after ego is settled and camera is active
         if self.enable_traffic:
             self._spawn_traffic()
+
+        # Initialize potential baseline now that route + ego both exist.
+        # Without this, the first step's F = γ·Φ(s_1) - 0 would be a
+        # one-shot ~-K·dist spike of ~-0.9 at worst (clamp=30, K=0.03).
+        self._prev_potential = self._potential()
 
         return self._get_obs(), {}
 
@@ -619,6 +629,86 @@ class CarlaEnv(gym.Env):
         return min(self.route_progress / self.total_route_length, 1.0)
 
     # ------------------------------------------------------------------
+    # Potential-based shaping helpers (Ng/Harada/Russell 1999).
+    #
+    # Φ(s) = -POTENTIAL_K · min(dist2D(ego, lookahead_point), DIST_CLAMP)
+    # F(s, s') = PPO_GAMMA · Φ(s') - Φ(s)          (per-step shaping)
+    # F(s, s_terminal) = -Φ(s)                      (episodic convention,
+    #                                                Φ(terminal) := 0)
+    #
+    # Lookahead point is the location LOOKAHEAD_ARC_M meters ahead of the
+    # current projection along the planned route. Uses self.route_index
+    # and self._prev_seg_t (fraction along current segment) so the target
+    # advances CONTINUOUSLY with ego — no discontinuity at waypoint
+    # transitions. See Agent-2 red-team: indexed-waypoint lookahead creates
+    # a negative F spike at every waypoint crossing, which disincentivizes
+    # advancing; continuous arc-length does not.
+    #
+    # Rationale for shaping existence: the 900k-step run at tip d307a66
+    # showed rolling RC flat at 5-6% across 1500 episodes. Progress reward
+    # (0.05 * progress_delta) gives signal only when ego moves forward on
+    # the route tangent; lateral drift off the route gives ~0 signal until
+    # OFF_ROUTE fires at 30m. With policy_std = 1.0 (at clamp), per-step
+    # actions are dominated by noise and the critic cannot distinguish
+    # "driving toward route" from "driving away". Φ = -dist to lookahead
+    # gives a DENSE lateral-alignment gradient the critic can learn.
+    # ------------------------------------------------------------------
+    PPO_GAMMA = 0.99
+    POTENTIAL_K = 0.03
+    LOOKAHEAD_ARC_M = 10.0
+    DIST_CLAMP_M = 30.0
+
+    def _lookahead_point(self):
+        """Return (x, y) of the point LOOKAHEAD_ARC_M meters ahead of
+        current route projection, walking segments forward.
+
+        Uses self.route_index and self._prev_seg_t so the target moves
+        continuously with ego (no per-waypoint-transition spikes).
+        Falls back to last waypoint if we run out of route.
+        """
+        if not self.route or len(self.route) < 2:
+            loc = self.vehicle.get_location()
+            return loc.x, loc.y
+        idx = self.route_index
+        t = self._prev_seg_t  # fraction along current segment [0, 1]
+        remaining = self.LOOKAHEAD_ARC_M
+        while idx < len(self.route) - 1:
+            a = self.route[idx].transform.location
+            b = self.route[idx + 1].transform.location
+            seg_len = a.distance(b)
+            if seg_len < 1e-3:
+                idx += 1
+                t = 0.0
+                continue
+            # Distance along this segment still ahead of ego:
+            seg_remaining = (1.0 - t) * seg_len
+            if seg_remaining >= remaining:
+                # Target lies within this segment
+                frac = t + remaining / seg_len
+                frac = min(frac, 1.0)
+                x = a.x + frac * (b.x - a.x)
+                y = a.y + frac * (b.y - a.y)
+                return x, y
+            remaining -= seg_remaining
+            idx += 1
+            t = 0.0
+        # Past end of route — anchor at last waypoint
+        last = self.route[-1].transform.location
+        return last.x, last.y
+
+    def _potential(self):
+        """Φ(s) = -POTENTIAL_K · min(dist2D(ego, lookahead), DIST_CLAMP)."""
+        if not self.route or len(self.route) < 2:
+            return 0.0
+        ego = self.vehicle.get_location()
+        tx, ty = self._lookahead_point()
+        dx = ego.x - tx
+        dy = ego.y - ty
+        dist = math.sqrt(dx * dx + dy * dy)
+        dist_clamped = min(dist, self.DIST_CLAMP_M)
+        return -self.POTENTIAL_K * dist_clamped
+
+    # ------------------------------------------------------------------
     # REWARD FUNCTION — CaRL-minimal (Jaeger, Chitta, Geiger 2025 §3.2)
     # plus idle_cost + persistent velocity carrot to close the
     # "sit-still local optimum" exploit observed in the 2026-04-22 run
@@ -773,6 +863,25 @@ class CarlaEnv(gym.Env):
             termination_reason = "REALLY_STUCK"
             print(f"[EPISODE END] reason=REALLY_STUCK "
                   f"steps_since_progress={self.step_count - self._last_significant_progress_step}")
+
+        # Potential-based shaping (Ng/Harada/Russell 1999). Added AFTER the
+        # terminal decision so we can use the episodic convention
+        # Φ(s_terminal) := 0, which gives F_terminal = -Φ(prev). This is
+        # what preserves optimal-policy invariance in finite-horizon MDPs
+        # (Grzes 2017 "Reward Shaping in Episodic RL"). Keeping Φ nonzero
+        # at terminal would inject a one-shot non-invariant bonus of
+        # magnitude K · dist_prev.
+        #
+        # Note on scale: max |F| per non-terminal step is
+        # K · (γ·Δs_max + (1-γ)·dist_clamp) ≈ 0.03 · (0.99·0.4165 + 0.01·30)
+        # ≈ 0.03 · 0.712 ≈ 0.021 — same scale as progress_reward max.
+        if terminated:
+            shaping = -self._prev_potential
+        else:
+            cur_potential = self._potential()
+            shaping = self.PPO_GAMMA * cur_potential - self._prev_potential
+            self._prev_potential = cur_potential
+        reward += shaping
 
         # Defensive clip widened to [-100, 100]. NaN/inf still force-terminate.
         if not math.isfinite(reward):
@@ -954,10 +1063,36 @@ class CarlaEnv(gym.Env):
         self._destroy_traffic()
 
         try:
-            tm = self.client.get_trafficmanager(self.port + 6000 + os.getpid() % 1000)
+            tm_port = self.port + 6000 + os.getpid() % 1000
+            tm = self.client.get_trafficmanager(tm_port)
             tm.set_global_distance_to_leading_vehicle(2.5)
             tm.set_synchronous_mode(True)
             tm.set_random_device_seed(random.randint(0, 10000))
+            # Hybrid physics mode: NPCs outside a physics radius around the
+            # ego are advanced by TM without full physics simulation. Known
+            # CARLA 0.9.x fix for "NPCs frozen in sync mode" — without this,
+            # NPCs that spawn > ~50m from the ego can fall into a dormant
+            # state where the TM never issues them motion commands and they
+            # stand still for the whole episode. Radius 70m covers the full
+            # route-vicinity; NPCs outside that will also move, just without
+            # high-fidelity collisions (which don't matter for NPCs we never
+            # touch).
+            # Refs: carla-simulator#3860, #4030 docs on hybrid physics.
+            try:
+                tm.set_hybrid_physics_mode(True)
+                tm.set_hybrid_physics_radius(70.0)
+            except AttributeError:
+                # Older CARLA versions (<0.9.11) lack these; skip silently.
+                pass
+            # Confirm sync state after apply — diagnostic for the
+            # "traffic doesn't move" report. If synchronous_mode read-back
+            # disagrees with the True we just set, that's the bug.
+            try:
+                world_sync = self.world.get_settings().synchronous_mode
+            except Exception:
+                world_sync = "?"
+            print(f"[TM] port={tm_port} sync_mode=True requested, "
+                  f"world.sync={world_sync} hybrid_physics=True radius=70m")
 
             # Spawn vehicles
             vehicle_bps = self.blueprint_library.filter("vehicle.*")

@@ -658,3 +658,116 @@ Append here when something changes materially.
   from the 233k-step checkpoint would leak the "sit still" prior into
   the fresh reward landscape. See `PC_CLAUDE_REWARD_FIX.md` for the
   exact paste block handed to PC-side.
+
+- **2026-04-23 ~00:45**: the idle_cost fix (`d307a66`) broke the
+  sit-still attractor but exposed the next failure mode. At 900k steps
+  / seed 137 / ~2h wall-clock the run showed rolling RC flat at 5-6%
+  across 1500 episodes with zero trend, mean_speed oscillating 2-6 m/s,
+  `policy_std` pinned at the 1.0 upper clamp for 1500+ episodes, and
+  termination distribution 48% OFF_ROUTE / 38% COLLISION / 14%
+  REALLY_STUCK. Best single episode RC 42.6% was a statistical fluke;
+  best rolling RC (8.24%) peaked at step 64k and hadn't improved in
+  830k steps. PPO stats otherwise healthy (`approx_kl=0.006`,
+  `entropy_loss=-2.36`). Agent learned to throttle but not to steer.
+
+- **Two independent red-team subagents** evaluated the options:
+  (a) full §6.2 BC pivot and (b) adding a shaping term. Both
+  converged on two diagnoses:
+  1. `policy_std=0.999` pinned at clamp is an **exploration**
+     pathology, not a gradient pathology. At std=1.0 the policy is
+     emitting essentially pure noise; every episode is a different
+     random walk and the critic cannot credit-assign.
+     Andrychowicz 2021 §4.5 viable band for continuous control from
+     scratch is [0.3, 0.7]; clamp at 1.0 was too permissive.
+  2. Even with a healthy exploration band, the progress reward is
+     **too sparse for a steering gradient**. It fires only when ego
+     projects forward on the route tangent; lateral drift gives ~0
+     signal until OFF_ROUTE at 30m. With random steering the agent
+     rarely observes the "aligned and advancing" state that carries
+     positive reward.
+
+- **Both agents rejected the full §6.2 BC pivot as specified** —
+  implementation burden is 28-45h (no BehaviorAgent rollout script,
+  no BC trainer, no KL-to-BC PPO path in `agents/train.py`), combined
+  probability of shipping 0.30-0.40, zero buffer for debugging. Early
+  pivot at 900k steps also violates §6.1 (don't judge before 3M per
+  Henderson 2018). The reward-shaping failure at 900k is not evidence
+  of the underlying RL-vs-BC question; it's evidence of *this*
+  reward's sparsity.
+
+- **PC-side Claude's proposed fix** was `r_heading = 0.1 * cos(angle)`
+  between ego heading and direction to next waypoint. Explicitly
+  **rejected**: that is the signed-cos shaping deleted in v2 per
+  §1.1/§2.1/§3.1. Ng/Harada/Russell 1999 says it's non-potential and
+  creates new optima; the 7M-run perpendicular-circling attractor is
+  the documented failure mode. Can't accept PC-side's suggestion
+  because PC-side doesn't have project-notes context.
+
+- **Fix pushed (this commit) — composed, experiment-axis only**:
+  1. `models/clamped_policy.py`: lowered `LOG_STD_MAX` from `0.0`
+     (std ≤ 1.0) to `log(0.7) ≈ -0.357` (std ≤ 0.7). Andrychowicz
+     2021 viable band. Targets the diagnosed policy_std-at-clamp
+     symptom directly.
+  2. `env/carla_env.py::_compute_reward`: added potential-based
+     shaping (Ng/Harada/Russell 1999). `Φ(s) = -0.03 · min(dist2D
+     (ego, lookahead), 30m)` where lookahead is the point 10m ahead
+     of current projection along the planned route (continuous arc-
+     length via `_lookahead_point`, no waypoint-transition
+     discontinuity). `F(s, s') = 0.99·Φ(s') - Φ(s)` on non-terminal
+     steps; `F(s, s_terminal) = -Φ(s)` on terminals (episodic
+     convention Φ(terminal):=0, Grzes 2017). Max |F| ≈ 0.021/step,
+     same scale as progress_reward; preserves progress as the
+     dominant signal. By construction per Ng 1999 this doesn't
+     create new optima — only a denser gradient.
+
+- **Why both changes in one run (against §8.1 "one axis at a time")**:
+  deadline math: BC pivot is 28-45h of dev + run, single-axis-
+  serialized experiments are ~46h (two fresh 23h runs back-to-back),
+  combined this run is ~24h with a T+15min sanity gate that aborts
+  early if the composed fix fails. Both agents independently flagged
+  both problems. §8.1 was written to separate EXPERIMENT from INFRA;
+  both of these changes are experiment-axis and target different
+  diagnosed failures. Beacon telemetry (`policy_std`, `rolling_RC`,
+  `termination_reasons`) lets us attribute effects per-axis.
+
+- **Alternative option considered and rejected**: increase
+  `progress_reward` scale from 0.05 to 0.15. Simpler change, but
+  scales the existing sparse signal rather than densifying it. Would
+  make the gradient stronger WHERE it fires, not fire it more often.
+  Doesn't address the "random steering can't find the signal" root
+  cause.
+
+- **Idle_cost status**: kept. `-0.15 · max(0, 1 - speed/1.0)` still
+  prevents the sit-still attractor. The 900k-step run showed
+  REALLY_STUCK only 14% (vs 70% pre-idle_cost fix) — idle_cost is
+  working as designed; the residual REALLY_STUCK episodes happen when
+  the agent drives off the road, gets stuck on terrain, and can't
+  recover. That's a steering problem, not a motivation problem.
+
+- **Infra fix bundled (TrafficManager hybrid physics)**: user + PC
+  Claude report NPCs not moving. The code sets `tm.set_synchronous_
+  mode(True)` and `world.apply_settings(synchronous_mode=True)`
+  correctly. Known CARLA 0.9.x quirk (carla-simulator#3860): NPCs
+  outside ego's physics radius fall into a dormant state in sync mode
+  unless `tm.set_hybrid_physics_mode(True)` + `tm.set_hybrid_physics_
+  radius(70.0)` are set. Added both in `_spawn_traffic`, plus a
+  diagnostic `[TM]` print on each spawn showing requested sync mode
+  and world sync read-back. Note: this is a defensive fix inside the
+  v2 infra (sync mode + v1-style per-reset TM creation). Does NOT
+  reintroduce any of the reverted infra changes from §3.2.
+
+- **Predicted post-fix outcomes (T+15min, T+1h, T+3h)**:
+  | time | expected signal |
+  |---|---|
+  | T+15m | policy_std drops below 0.7 (enforced by clamp); avg_speed > 2 m/s (idle_cost); dense shaping begins moving the mean network |
+  | T+1h  | rolling RC crosses 10% if shaping is doing its job |
+  | T+3h  | rolling RC crosses 15-20%; REALLY_STUCK < 10%; approx_kl stable at 0.01-0.03; std settling in [0.4, 0.6] |
+  If rolling RC is still <10% at T+1h, the shaping isn't the right
+  lever and we have 23h left before deadline for the minimal-BC
+  fallback (the skip-value-bootstrap, skip-KL-to-BC version — per
+  Agent-1 red-team this is ~12-16h of dev work, still fits).
+
+- **PC-side instructions**: `PC_CLAUDE_REWARD_FIX_2.md`. Kill current
+  run, pull this tip, archive collapsed artifacts
+  (`v2_rl.flatrc-<ts>`), fresh weights, seed 211 (different from 42
+  and 137), T+15min sanity check with std threshold.
