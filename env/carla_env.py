@@ -109,12 +109,9 @@ class CarlaEnv(gym.Env):
                         a.destroy()
                     except Exception:
                         pass
-            # Tick to flush destructions (works whether server is sync or async).
-            # seconds=10 guards against an indefinite block on initial-startup
-            # cleanup (issue #4 root-cause analysis: bare tick() blocks when the
-            # TM race or sync-mode deadlock has happened).
+            # Tick to flush destructions (works whether server is sync or async)
             try:
-                self.world.tick(seconds=10.0)
+                self.world.tick()
             except Exception:
                 pass
 
@@ -122,23 +119,6 @@ class CarlaEnv(gym.Env):
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 0.05  # 20 Hz
         self.world.apply_settings(settings)
-
-        # TrafficManager — created ONCE in __init__, reused across all resets.
-        # CARLA issue #2789 documents a hang when `get_trafficmanager` is
-        # called after world reloads with a TM previously registered in sync
-        # mode; issue #9172 documents a race in 0.9.15's TrafficManagerLocal.cpp
-        # that fires preferentially when tick cadence slows (e.g., during PPO's
-        # gradient update). Creating the TM once and leaving it attached avoids
-        # re-registration across resets and prevents the TM-client/TM-server
-        # state from churning under the race window.
-        # Each env instance has its own TM port (base port + 6000 + pid offset);
-        # with port spacing of 1000 across workers, ranges never overlap.
-        self._tm = self.client.get_trafficmanager(
-            self.port + 6000 + os.getpid() % 1000
-        )
-        self._tm.set_global_distance_to_leading_vehicle(2.5)
-        self._tm.set_synchronous_mode(True)
-        self._tm.set_random_device_seed(random.randint(0, 10000))
 
         # Route planner from CARLA's PythonAPI (agents.navigation.global_route_planner).
         # Our project also has an 'agents/' directory which can shadow CARLA's.
@@ -295,7 +275,7 @@ class CarlaEnv(gym.Env):
             # (60deg) doesn't account for post-spawn rotation. 30deg is the
             # tighter post-spawn tolerance; misaligned spawns get destroyed.
             try:
-                self.world.tick(seconds=10.0)
+                self.world.tick()
             except Exception:
                 pass
             try:
@@ -376,15 +356,12 @@ class CarlaEnv(gym.Env):
         got_image = False
         for _ in range(100):  # ~5s sim time, ~5-15s wall
             try:
-                # seconds=10.0: if the CARLA server hangs on tick, surface
-                # it as a RuntimeError within 10s instead of blocking the
-                # worker forever (GitHub issue #3: multi-env sync deadlock).
-                self.world.tick(seconds=10.0)
+                self.world.tick()
             except RuntimeError as e:
                 # Server hiccup mid-tick. One retry, then raise.
                 print(f"[reset] world.tick() raised {e}; retrying once")
                 time.sleep(0.5)
-                self.world.tick(seconds=10.0)
+                self.world.tick()
             if self.image is not None:
                 got_image = True
                 break
@@ -447,47 +424,23 @@ class CarlaEnv(gym.Env):
             throttle=throttle, steer=steer, brake=brake
         ))
 
-        # Defensive tick with timeout: a single transient server hiccup
-        # shouldn't kill the whole rollout, AND an indefinite hang (GitHub
-        # issue #3: multi-env sync deadlock) must not block SubprocVecEnv
-        # forever. seconds=10.0 turns a hang into a RuntimeError we can
-        # reconnect-retry once, then surface. If the retry also fails,
-        # the worker raises; SubprocVecEnv propagates; PPO crashes with a
-        # clear traceback (which the watchdog can restart from).
+        # Defensive tick: a single transient server hiccup shouldn't kill the
+        # whole rollout. One reconnect+retry, then surface the failure.
         try:
-            self.world.tick(seconds=10.0)
+            self.world.tick()
         except RuntimeError as e:
             print(f"[step] world.tick() raised {e}; reconnecting and retrying once")
             try:
                 self.client = carla.Client(CARLA_HOST, self.port)
                 self.client.set_timeout(20.0)
                 self.world = self.client.get_world()
-                self.world.tick(seconds=10.0)
+                self.world.tick()
             except Exception as e2:
                 raise RuntimeError(f"world.tick() failed after reconnect: {e2}")
 
         obs = self._get_obs()
         reward, terminated = self._compute_reward(action)
         self.prev_action = np.array([steer, throttle_brake], dtype=np.float32)
-
-        # Inline per-worker spectator camera update. Each worker owns its own
-        # CARLA server (port N); setting the spectator transform on THAT server
-        # makes THAT server's window follow THAT worker's ego — so with 4 envs
-        # the user sees 4 CARLA windows each tracking their own agent.
-        # This REPLACES the external scripts/spectator.py process, which was a
-        # secondary client on port 2000 that created the multi-client sync-mode
-        # race documented in CARLA issues #1996 / #2239 (GitHub issue #4).
-        # Cost: one RPC per step per worker (~microseconds on localhost).
-        if self.vehicle is not None:
-            try:
-                loc = self.vehicle.get_location()
-                self.world.get_spectator().set_transform(carla.Transform(
-                    carla.Location(x=loc.x, y=loc.y, z=loc.z + 40),
-                    carla.Rotation(pitch=-90),
-                ))
-            except Exception:
-                # Spectator is cosmetic — never let its failure kill training.
-                pass
 
         truncated = self.step_count >= self.max_episode_steps
 
@@ -981,14 +934,9 @@ class CarlaEnv(gym.Env):
         self._destroy_traffic()
 
         try:
-            # Reuse the cached TM handle created in __init__. Do NOT call
-            # get_trafficmanager() again per reset — see CARLA issues #2789
-            # and #9172 for why re-registration under a slow-tick window
-            # causes silent deadlocks.
-            tm = self._tm
-            # Re-seed each episode for traffic diversity across resets, but
-            # do not toggle synchronous_mode or other state — those were set
-            # once at __init__ and should stay stable.
+            tm = self.client.get_trafficmanager(self.port + 6000 + os.getpid() % 1000)
+            tm.set_global_distance_to_leading_vehicle(2.5)
+            tm.set_synchronous_mode(True)
             tm.set_random_device_seed(random.randint(0, 10000))
 
             # Spawn vehicles
@@ -1233,10 +1181,9 @@ class CarlaEnv(gym.Env):
                     pass
             # Only tick explicitly when using the individual-destroy fallback,
             # because individual destroy() in sync mode queues commands that
-            # require a tick to take effect. seconds=10 prevents indefinite
-            # block if the destroy triggers a TM-race window (issue #4 analysis).
+            # require a tick to take effect.
             try:
-                self.world.tick(seconds=10.0)
+                self.world.tick()
             except Exception:
                 pass
 
