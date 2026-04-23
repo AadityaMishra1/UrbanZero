@@ -255,13 +255,34 @@ def main():
     # learned log_std rather than forcing wider exploration.
     _is_bc_finetune = bool(os.environ.get("URBANZERO_BC_WEIGHTS", "").strip())
     if _is_bc_finetune:
+        # H2+H3+H4 fix (Issue #7): the lr reduction alone failed to tame
+        # KL because the dominant variable is σ, not lr. BC converged to
+        # std=0.22; PPO's log-prob ratio scales as 1/σ² so gradients at
+        # σ=0.22 are ~20x larger than at σ=1.0. n_epochs=3 compounded
+        # the amplified updates; clip_range=0.2 was too wide for the
+        # ratio at that σ. Three-axis fix keeps BC's mean network intact
+        # while making PPO's update step PPO-robust:
+        #   (H2) widen log_std at warmstart load to log(0.5)=-0.69 —
+        #        Andrychowicz 2021 §4.5 viable band [0.3, 0.7]; keeps
+        #        the good actor network, loosens over-confident variance.
+        #   (H3) n_epochs 3 → 1 (Roach 2021 §3.2 single-epoch finetune)
+        #   (H4) clip_range 0.2 → 0.1 (Schulman 2017 §6.1, "careful
+        #        finetune" value standard in BC→PPO pipelines)
         LR_BC_FINETUNE = 1e-4
         ENT_COEF_START = 0.005
         ENT_COEF_FLOOR = 0.001
-        print(f"  [BC-finetune] lr={LR_BC_FINETUNE}, "
-              f"ent_coef {ENT_COEF_START}->{ENT_COEF_FLOOR} (floor)")
+        N_EPOCHS_BC = 1
+        CLIP_RANGE_BC = 0.1
+        WIDEN_LOG_STD_TO = -0.69  # log(0.5); std 0.22 → 0.50
+        print(f"  [BC-finetune] lr={LR_BC_FINETUNE}, n_epochs={N_EPOCHS_BC}, "
+              f"clip_range={CLIP_RANGE_BC}, "
+              f"ent_coef {ENT_COEF_START}->{ENT_COEF_FLOOR} (floor), "
+              f"widen_log_std={WIDEN_LOG_STD_TO}")
     else:
         LR_BC_FINETUNE = 3e-4  # from-scratch default
+        N_EPOCHS_BC = 3
+        CLIP_RANGE_BC = 0.2
+        WIDEN_LOG_STD_TO = None
 
     print(f"=== UrbanZero Training ===")
     print(f"  Envs: {args.n_envs}")
@@ -397,9 +418,9 @@ def main():
             # Without this, PPO.load() silently uses the old LR/epochs from the
             # checkpoint, ignoring the tuned values above.
             learning_rate=LR_BC_FINETUNE,
-            n_epochs=3,
+            n_epochs=N_EPOCHS_BC,
             ent_coef=ENT_COEF_START,
-            clip_range=0.2,
+            clip_range=CLIP_RANGE_BC,
             max_grad_norm=0.5,
         )
     else:
@@ -419,14 +440,29 @@ def main():
                 learning_rate=LR_BC_FINETUNE,
                 n_steps=n_steps,
                 batch_size=batch_size,
-                n_epochs=3,
+                n_epochs=N_EPOCHS_BC,
                 gamma=0.99,
                 gae_lambda=0.95,
                 ent_coef=ENT_COEF_START,
                 vf_coef=0.5,
-                clip_range=0.2,
+                clip_range=CLIP_RANGE_BC,
                 max_grad_norm=0.5,
             )
+            # H2 fix (Issue #7): BC converged to std=[0.22, 0.21] which
+            # amplifies PPO's log-prob-ratio gradients by ~20x vs std=1.0.
+            # Widen log_std without touching the mean network — keeps BC's
+            # good actor (MAE=0.05) while letting PPO updates not blow up.
+            # Target: std=0.5 → log_std=log(0.5)≈-0.69 (Andrychowicz 2021
+            # §4.5 viable band [0.3, 0.7] — within the existing upper clamp
+            # at log(0.7)≈-0.357 in models/clamped_policy.py).
+            if WIDEN_LOG_STD_TO is not None:
+                with torch.no_grad():
+                    old_ls = model.policy.log_std.data.clone()
+                    model.policy.log_std.data.fill_(WIDEN_LOG_STD_TO)
+                    new_std = torch.exp(model.policy.log_std.data)
+                print(f"[BC-warmstart] widened log_std {old_ls.tolist()} -> "
+                      f"{model.policy.log_std.data.tolist()} "
+                      f"(std now {new_std.tolist()})")
             # Attempt to load sibling VecNormalize stats.  The BC trainer
             # saves identity stats (no real rollouts), so this is mainly
             # for structural completeness; reward normalization will adapt
