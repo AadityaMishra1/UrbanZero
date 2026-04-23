@@ -620,21 +620,30 @@ class CarlaEnv(gym.Env):
 
     # ------------------------------------------------------------------
     # REWARD FUNCTION — CaRL-minimal (Jaeger, Chitta, Geiger 2025 §3.2)
-    # with a small velocity carrot annealed to zero for no-gradient-desert
-    # breakage during from-scratch exploration.
+    # plus idle_cost + persistent velocity carrot to close the
+    # "sit-still local optimum" exploit observed in the 2026-04-22 run
+    # (see PROJECT_NOTES.md §11, EARLY_WARNING_REALLY_STUCK.md).
     #
     # Per-step:
     #   r_progress  = 0.05 * min(progress_delta_m, TARGET_SPEED*dt)   (CaRL)
-    #   r_carrot    = 0.005 * min(speed, TARGET)/TARGET * anneal_coef (warmup)
-    #                 anneal_coef linearly 1 -> 0 over CARROT_DECAY_STEPS
-    #                 per-worker env-steps. Cite: Hessel et al. 2018 "Rainbow"
-    #                 §3.2 warmup shaping; Vinyals et al. 2019 AlphaStar
-    #                 early-phase progress shaping. Rationale for including:
-    #                 pure progress reward is ~0 per step until the agent
-    #                 discovers motion, which can take O(M) random-policy
-    #                 steps per Andrychowicz et al. 2021 — the annealed carrot
-    #                 supplies a gradient during that window. By the time the
-    #                 reward becomes pure CaRL, the policy has a driving prior.
+    #   r_carrot    = 0.005 * min(speed, TARGET)/TARGET                (persistent)
+    #                 Kept live for the whole run (anneal removed). Cite:
+    #                 Rajeswaran et al. 2017 §3 — annealing exploration /
+    #                 shaping bonuses to zero lets the policy regress. The
+    #                 2026-04-22 run collapsed to avg_speed = 0.224 m/s by
+    #                 step 233k while the carrot was still ~50% live; that
+    #                 is evidence the initial carrot was insufficient even
+    #                 before reaching zero.
+    #   r_idle      = -0.15 * max(0, 1 - speed / 1.0)                  (anti-stall)
+    #                 Continuous-at-1.0 ramp: -0.15 at speed=0, 0 at speed>=1.
+    #                 Motivation: 1500-step REALLY_STUCK at -50 terminal is
+    #                 -0.033/step, while a 300-step crash at -50 is -0.167/step.
+    #                 Sit-still was ~5x cheaper per step than crashing; agent
+    #                 correctly found the local optimum. Adding -0.15/step at
+    #                 zero speed makes 1500 steps of sitting = -225 shaping
+    #                 + -50 terminal = -0.183/step, now more expensive than
+    #                 crashing. Continuous ramp (no threshold) avoids the
+    #                 1.01-m/s hover attractor from the v1 idle penalty.
     #
     # Terminals (scale 10x vs per-step so they dominate episode return even
     # after γ=0.99 discount at ~500-step episodes; compare with shaping sum
@@ -655,12 +664,19 @@ class CarlaEnv(gym.Env):
     #   - overspeed_penalty -> redundant with progress_cap
     #   - lateral_penalty   -> redundant with off_route termination
     #   - smoothness_penalty (CAPS) -> BC-warmstart provides the prior
-    #   - idle_penalty with gating -> 1.5 m/s threshold created hover attractor
     #   - stagnation_counter termination -> twitch-game exploit (commit 8791388)
+    #
+    # NOTE on idle_cost vs deleted v1 idle_penalty:
+    #   v1 idle_penalty used a hard threshold at 1.5 m/s which created a
+    #   1.01-m/s hover attractor (speed > 1 was "enough" to dodge penalty,
+    #   no incentive to go faster). The new idle_cost is a continuous ramp
+    #   with no discontinuity at speed=1, and the persistent velocity carrot
+    #   provides the gradient pulling the agent above 1 m/s toward TARGET.
     # ------------------------------------------------------------------
 
     # Per-worker global step counter and carrot anneal horizon (env-steps).
-    # Class-level sentinels; instance overrides in __init__.
+    # CARROT_DECAY_STEPS_DEFAULT retained for backward compat with env vars,
+    # but the carrot is now always-on; see _compute_reward.
     CARROT_DECAY_STEPS_DEFAULT = 500_000
 
     def _compute_reward(self, action):
@@ -673,15 +689,19 @@ class CarlaEnv(gym.Env):
         capped_progress = min(progress_delta, TARGET_PROGRESS_CAP)
         progress_reward = 0.05 * capped_progress
 
-        # 2. Velocity carrot (annealed warmup shaping).
-        # Small positive for any forward speed up to TARGET, decays to 0.
-        # Scale matches progress: 0.005 max vs 0.021 max progress per step,
-        # so even at max carrot the progress signal is 4x stronger.
-        anneal_coef = max(0.0,
-                          1.0 - self._worker_step_counter / self._carrot_decay_steps)
-        carrot = 0.005 * min(speed, TARGET_SPEED) / TARGET_SPEED * anneal_coef
+        # 2. Velocity carrot (persistent, un-annealed).
+        # Small positive for any forward speed up to TARGET. Max 0.005/step
+        # vs max 0.021/step progress, so progress still dominates when the
+        # agent is actually driving. Un-anneal rationale: see header.
+        carrot = 0.005 * min(speed, TARGET_SPEED) / TARGET_SPEED
 
-        reward = progress_reward + carrot
+        # 3. Idle cost — continuous anti-stall term. Zero above 1 m/s.
+        # -0.15/step at speed=0 makes the 1500-step REALLY_STUCK trajectory
+        # ~-275 total, >5x worse per step than a 300-step crash. See header
+        # for the full per-step cost comparison that motivates -0.15.
+        idle_cost = -0.15 * max(0.0, 1.0 - speed / 1.0)
+
+        reward = progress_reward + carrot + idle_cost
         terminated = False
         termination_reason = None
 

@@ -593,3 +593,68 @@ Append here when something changes materially.
   patterns than others. The prior 7M run happened to dodge it
   statistically, the v2 runs happened to trigger it. v1 infra + v2
   experiment + DummyVecEnv is the correct combination.
+
+- **2026-04-22 22:16**: long run (tip `5814854`, fresh weights from
+  `cfafe73`-minus-this-commit) at 233k steps / 31 min wall-clock
+  diverged: `avg_speed = 0.224 m/s`, `REALLY_STUCK ≥ 70%` in rolling
+  window, last 18 consecutive episodes all `REALLY_STUCK`, rolling RC
+  peaked 5.19% at step 142k and regressed to 1.78% by step 233k.
+  Agent learned the sit-still local optimum — full failure report
+  in `EARLY_WARNING_REALLY_STUCK.md`. PPO stats were healthy
+  (`approx_kl=0.014`, `entropy_loss=-2.36`, `policy_std=0.787`),
+  ruling out optimizer pathology. The explanation is a **reward
+  structure exploit**, not a bug.
+
+- **Per-step cost analysis (why sit-still dominates)**:
+  REALLY_STUCK fires at 1500 steps of zero net progress. With the
+  previous reward, a stuck trajectory accumulated ≈0 per-step shaping
+  plus `-50` terminal, i.e. `-0.033/step`. A collision trajectory
+  averaged `~300` steps before crashing, so `-50/300 = -0.167/step`.
+  **Sitting still was 5x cheaper per step than moving and crashing.**
+  The agent's policy gradient correctly converged to that local
+  optimum. Agent 2's red-team finding A8 (pre-run review) flagged this
+  exact risk; I acknowledged it but did not weight it strongly enough
+  in the launch reward. That was my error.
+
+- **Reward fix pushed** (this commit):
+  1. Added `idle_cost = -0.15 * max(0.0, 1.0 - speed / 1.0)` in
+     `_compute_reward`. Continuous ramp: `-0.15/step` at zero speed,
+     `0` at `speed ≥ 1 m/s`. New per-step cost of sit-still becomes
+     `-225` shaping + `-50` terminal over 1500 steps = `-0.183/step`,
+     now **more** expensive than a `-0.167/step` crash.
+  2. Un-annealed the velocity carrot (removed `anneal_coef`). Carrot
+     is now `0.005 * min(speed, TARGET)/TARGET` for the full run.
+     Rationale: Rajeswaran et al. 2017 §3 — annealing shaping bonuses
+     to zero lets the policy regress. The 233k-step run collapsed
+     while the carrot was still ~53% live, so even the partial anneal
+     was insufficient. Keeping it on permanently provides a constant
+     gradient rewarding forward motion, which is needed to overcome
+     the kink at `speed=1.0` where `idle_cost` bottoms out.
+
+- **Continuous-ramp idle vs v1 threshold idle**: the deleted v1
+  `idle_penalty` used a hard threshold at 1.5 m/s that created a
+  1.01-m/s hover attractor (once above 1, no incentive to go faster;
+  once below, a cliff-style penalty). The new `idle_cost` is smooth
+  at 1.0 m/s (value is 0 at 1 m/s, derivative is 0 above, -0.15 below)
+  and the persistent carrot supplies the continued gradient toward
+  TARGET_SPEED for `speed > 1`. So the hover-at-1.0 failure mode
+  is not reintroduced.
+
+- **Predicted post-fix per-step economics**:
+  | scenario | 1500-step shaping | terminal | per-step |
+  |---|---|---|---|
+  | sit still at 0 m/s for 1500 steps | −225.0 | −50 (REALLY_STUCK) | −0.183 |
+  | creep at 0.5 m/s pointless | −112.5 | −50 (REALLY_STUCK) | −0.108 |
+  | drive at TARGET, crash at 300 steps | +7.8 progress + +1.5 carrot | −50 (COLLISION) | −0.137 |
+  | drive at TARGET, full success | +31.3 progress + +7.5 carrot | +50 (ROUTE_COMPLETE) | +0.059 |
+
+  Ranking: success (+0.059) > crash (−0.137) > slow creep (−0.108) >
+  sit still (−0.183). Sit-still is now strictly dominated. Crash is
+  cheaper than creep, which is the desired ordering — it pushes the
+  agent to explore real driving rather than safe pointless motion.
+
+- **Action item on instructions**: the PC-side Claude is to kill the
+  current run and restart from fresh weights (not resume). Continuing
+  from the 233k-step checkpoint would leak the "sit still" prior into
+  the fresh reward landscape. See `PC_CLAUDE_REWARD_FIX.md` for the
+  exact paste block handed to PC-side.
