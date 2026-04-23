@@ -567,6 +567,29 @@ From the conversation, in order:
 
 Append here when something changes materially.
 
-- **2026-04-23**: file created at tip `0a3f114` / docs `90f14d3` after
+- **2026-04-23 early AM**: file created at tip `0a3f114` / docs `90f14d3` after
   the infra revert addressing issues #3/#4/#6. Awaiting PC-side smoke
   test before proceeding to the 15M-step run or the BC pivot.
+- **2026-04-23 after issue-#6 PC-side report**: root cause finally
+  identified from the PC-side operator's traceback, not from any of my
+  prior theorizing. The crash is `BrokenPipeError` in `ForkServerProcess-2`
+  inside `stable_baselines3/common/vec_env/subproc_vec_env.py:43`
+  `_worker()` calling `remote.send(...)`. Main process then blocks forever
+  on `remote.recv()` via `unix_stream_read_generic`. SB3's `SubprocVecEnv`
+  has no worker-death recovery — this is a documented limitation, NOT
+  a CARLA or reward bug. **Proof the experiment code is fine**: the
+  20:03 run that survived to iteration 3 hit 147 FPS with healthy PPO
+  metrics (`approx_kl=0.0055`, `entropy_loss=-1.84`, `std=0.607`).
+- **Fix pushed**: `agents/train.py` now uses `DummyVecEnv` unconditionally,
+  not `SubprocVecEnv`. All envs run serially in the main process: no
+  pipes, no IPC, no BrokenPipeError possible. Expected throughput
+  ~90-110 FPS at 2 envs (vs 147 FPS with SubprocVecEnv) — well above
+  the 70 FPS PASS gate. Reliability chosen over throughput.
+- **Theories that turned out wrong, recorded so I don't retread them**:
+  (a) GPU contention at 4-env scale, (b) CARLA #9172 TM race, (c) my
+  own TM caching / inline spectator / `world.tick(seconds=10.0)`
+  additions. None caused the observed hangs. What caused them was an
+  upstream SB3 IPC fragility that triggers more under some scheduling
+  patterns than others. The prior 7M run happened to dodge it
+  statistically, the v2 runs happened to trigger it. v1 infra + v2
+  experiment + DummyVecEnv is the correct combination.

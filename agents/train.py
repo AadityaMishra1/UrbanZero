@@ -32,7 +32,7 @@ from models.clamped_policy import ClampedStdPolicy
 from eval.evaluator import DrivingMetricsCallback
 from eval.beacon_callback import BeaconCallback
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecFrameStack
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecFrameStack
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList, BaseCallback
 import torch
 import time as _time
@@ -253,16 +253,34 @@ def main():
     print(f"  Checkpoint dir: {CKPT_DIR}")
     print(f"  Ent-coef schedule: {ENT_COEF_START} -> {ENT_COEF_FLOOR} (floor) over 10M steps")
 
-    # Create vectorized environment
+    # Create vectorized environment.
+    #
+    # DummyVecEnv, not SubprocVecEnv — see GitHub issues #3/#4/#6 in this
+    # repo. SB3's SubprocVecEnv has no worker-death recovery: when a
+    # worker process dies (e.g. BrokenPipeError in the step pipe),
+    # SubprocVecEnv.step_wait() calls remote.recv() with no timeout,
+    # and the trainer hangs forever on `unix_stream_read_generic`. This
+    # is a documented SB3 limitation, not a CARLA issue — even a
+    # successful 3-iteration run at 147 FPS was killed by a subsequent
+    # worker crash we couldn't catch.
+    #
+    # DummyVecEnv runs all envs serially in the main process: no pipes,
+    # no IPC, no BrokenPipeError possible. The envs still connect to
+    # their own CARLA servers on their own ports; the only difference
+    # is that env.step() calls are sequential instead of parallel.
+    # At 2 envs the wall-clock cost is ~30-40% throughput (147 FPS -> ~90-110
+    # FPS expected) — well above the 70 FPS PASS gate. Reliability
+    # dominates throughput at this deadline.
+    #
+    # If we ever need the throughput, wrap SubprocVecEnv with a custom
+    # class that catches BrokenPipeError/EOFError on step_wait() and
+    # restarts the dead worker. Out of scope for the Saturday deadline.
     env_fns = [
         make_env(i, args.base_port, not args.no_traffic, not args.no_weather, seed)
         for i in range(args.n_envs)
     ]
-
-    if args.n_envs == 1:
-        env = DummyVecEnv(env_fns)
-    else:
-        env = SubprocVecEnv(env_fns)
+    env = DummyVecEnv(env_fns)
+    print(f"  VecEnv: DummyVecEnv (n_envs={args.n_envs}, serial stepping)")
 
     # Frame stacking: 4 frames for temporal information
     # CRITICAL: must specify channels_order because our image is float32 [0,1],

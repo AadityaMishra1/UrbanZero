@@ -2,7 +2,7 @@
 
 **Date written:** 2026-04-23 (revised 4x after deploy-side failures)
 **Branch:** `claude/setup-av-training-VetPV`
-**Tip commit:** `0a3f114` (revert infra to v1 (834a8e0) behavior, keep v2 experiment changes)
+**Tip commit:** (post-fix after issue #6 PC-side report — tip will be printed after the next push; see STEP 1 for verification)
 **Purpose:** 10-minute smoke test of the v2 reward/obs/policy changes on TOP of v1's known-stable infrastructure. The 7M-step run used v1 infra at 2 envs with no special CARLA flags — this test reproduces exactly that infra setup and only layers the experiment changes on top.
 
 **Revisions to date:**
@@ -20,12 +20,18 @@ revision removes ALL the infra changes and reverts to v1's exact
 infrastructure behavior. Only the experiment changes (reward / obs /
 policy hyperparameters) are kept.
 
-**What's in this revision (tip `0a3f114`):**
-- TrafficManager creation back in `_spawn_traffic()` per reset (v1 pattern)
-- No inline spectator in `step()` (gone)
-- `world.tick()` calls are BARE (no `seconds=10.0`)
-- Default `URBANZERO_N_ENVS` back to **2** (the 7M run's proven config)
-- Default CARLA launch flags: **no `-quality-level=Low`, no forced resolution** — just the port override. Matches what the user was doing on the 7M run.
+**What's in this revision (post-issue-#6 fix):**
+- v1 infra preserved: TM per-reset, no inline spectator, bare `world.tick()`.
+- **`DummyVecEnv` instead of `SubprocVecEnv` in `agents/train.py`.** This
+  is the real fix for issues #3/#4/#6. The BrokenPipeError in worker
+  subprocesses that killed every prior attempt cannot happen with
+  DummyVecEnv because there are no worker subprocesses. All envs run
+  serially in the main process.
+- Default `URBANZERO_N_ENVS=2`.
+- Default CARLA launch flags (port only — no `-quality-level=Low`).
+- Expected throughput: 90-110 FPS at 2 envs (down from the 147 FPS
+  measured with SubprocVecEnv during the single surviving 20:03 run,
+  but no BrokenPipeError risk).
 
 ---
 
