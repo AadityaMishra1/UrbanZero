@@ -226,8 +226,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Behavior Cloning trainer for UrbanZero (Gaussian NLL)."
     )
-    parser.add_argument("--data", type=str, required=True,
-                        help="Path to .npz file from collect_bc_data.py")
+    parser.add_argument("--data", type=str, required=True, nargs="+",
+                        help="One or more .npz files from collect_bc_data.py. "
+                             "Multiple files are concatenated in order; "
+                             "episode boundaries at join points are preserved "
+                             "so stacking never crosses files.")
     default_out = os.path.expanduser("~/urbanzero/checkpoints/bc_pretrain.zip")
     parser.add_argument("--output", type=str, default=default_out,
                         help="Output SB3 .zip path "
@@ -253,30 +256,51 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    data_path   = os.path.expanduser(args.data)
+    data_paths = [os.path.expanduser(p) for p in args.data]
     output_path = os.path.expanduser(args.output)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     device = torch.device(args.device)
-    print(f"[BC-train] device={device}  data={data_path}")
+    print(f"[BC-train] device={device}  data={data_paths}")
 
     # ------------------------------------------------------------------
-    # 1. Load data
+    # 1. Load data (supports multiple .npz files — parallel collection)
     # ------------------------------------------------------------------
-    print("[BC-train] Loading .npz ...")
-    npz = np.load(data_path, allow_pickle=True)
-    raw_images  = npz["images"]    # (N, 1, 128, 128) float32
-    raw_states  = npz["states"]    # (N, 10) float32
-    raw_actions = npz["actions"]   # (N, 2) float32
+    images_parts = []
+    states_parts = []
+    actions_parts = []
+    episode_starts_parts = []
+    any_has_ep_starts = False
+    for data_path in data_paths:
+        print(f"[BC-train] Loading {data_path} ...")
+        npz = np.load(data_path, allow_pickle=True)
+        images_parts.append(npz["images"])
+        states_parts.append(npz["states"])
+        actions_parts.append(npz["actions"])
+        if "episode_starts" in npz.files:
+            part_ep = npz["episode_starts"].astype(bool).copy()
+            # At every file join, the first frame of a new file is the
+            # start of a new episode (the collector was restarted).
+            # Force True so the stacker refuses to walk back across files.
+            part_ep[0] = True
+            episode_starts_parts.append(part_ep)
+            any_has_ep_starts = True
+        else:
+            fallback = np.zeros(len(npz["images"]), dtype=bool)
+            fallback[0] = True
+            episode_starts_parts.append(fallback)
+    raw_images  = np.concatenate(images_parts, axis=0)
+    raw_states  = np.concatenate(states_parts, axis=0)
+    raw_actions = np.concatenate(actions_parts, axis=0)
     # episode_starts may be missing in legacy .npz files written before
     # the 2026-04-23 collector update; fall back to None (legacy stacking).
-    if "episode_starts" in npz.files:
-        raw_episode_starts = npz["episode_starts"].astype(bool)
+    if any_has_ep_starts:
+        raw_episode_starts = np.concatenate(episode_starts_parts, axis=0)
         n_eps = int(raw_episode_starts.sum())
         print(f"[BC-train] episode_starts present: {n_eps} episodes")
     else:
         raw_episode_starts = None
-        print("[BC-train] WARNING: .npz has no episode_starts; "
+        print("[BC-train] WARNING: no .npz has episode_starts; "
               "stacking will contaminate first 3 frames of each episode "
               "(legacy behavior)")
     N = len(raw_images)

@@ -929,3 +929,57 @@ Append here when something changes materially.
   assumption: the NPC fix ACTUALLY fixes frozen NPCs. If Run-4's
   T+10min check still shows NPCs frozen, immediately pivot to BC
   (BehaviorAgent is rules-based and doesn't need moving NPCs).
+
+- **2026-04-23 ~02:30 — user elected to skip Run-4 and go BC-only**.
+  Tabula-rasa constraint was explicitly relaxed per §0; user's
+  direction: "lets just start with the BC, lets just do that, i
+  want to get this done with, nothing wrong with a lil pre training
+  right?" Single-path BC plan eliminates the 90-minute "is Run-4
+  working" decision gate and spends the entire compute budget on
+  the expert-initialized path.
+
+- **BC-only three-phase plan** (`PC_CLAUDE_BC_ONLY.md`):
+  - Phase 1: parallel BC data collection on BOTH ports
+    simultaneously. 50k frames on port 2000 (seed 77) + 50k on port
+    3000 (seed 78) = 100k total. Halves wall-clock vs serial.
+    Expected ~45-90min wall.
+  - Phase 2: `agents/train_bc.py` concatenates both .npz files
+    with episode-boundary preservation (added `nargs="+"` to the
+    `--data` arg). 20-epoch Gaussian NLL training on RTX 4080S
+    (~30min-2h).
+  - Phase 3: PPO finetune on 2 envs with `URBANZERO_BC_WEIGHTS`
+    pointing to bc_pretrain.zip. Seed 911. 5M steps (~11.5h at
+    122 FPS).
+  - Total wall: 12-16h. Deadline margin: 48h for eval + demo
+    + report.
+
+- **Why BC-only now vs parallel Run-4+BC**: user was tired of the
+  "reward-shaping lottery" with three consecutive collapses. BC
+  gives a policy that already drives (BehaviorAgent follows lanes
+  and routes by construction). PPO finetunes it under the same
+  reward that failed pure-RL — but starting from a good prior, the
+  reward's weakness at producing initial driving behavior doesn't
+  matter; it only needs to refine existing behavior. Roach 2021
+  reports BC+PPO reaches 80% LB with just 10M finetune steps from
+  a BehaviorAgent prior.
+
+- **train_bc.py multi-file support** (this commit): `--data` arg
+  now takes multiple .npz paths via `nargs="+"`. Concatenates them
+  in order and preserves episode boundaries at join points (forces
+  episode_starts[0] = True on each file so the stacker refuses to
+  walk back across file boundaries). Required for the parallel-
+  collection plan.
+
+- **Expected behavior at PPO finetune T+5min** (different from any
+  pure-RL run): avg_speed > 3 m/s from step 0, policy_std starts
+  small (~0.3), COLLISION% < 40, OFF_ROUTE% < 25, rolling_RC > 8%.
+  If T+5min looks like a pure-RL run (avg_speed ~0, RC 0%), the BC
+  prior did not transfer correctly — likely a VecNormalize stats
+  mismatch or PPO.load path issue. That's the one untested-E2E
+  risk flagged in §11 and in PC_CLAUDE_BC_ONLY.md RED-4.
+
+- **p(ship) under BC-only plan ≈ 0.75**. Up from 0.62 because:
+  (i) no time lost on Run-4 uncertainty, (ii) BC gives a stronger
+  behavioral prior than any reward-shaping we've tried, (iii) the
+  remaining 25% risk is concentrated in "BC pipeline first-run
+  bugs" — a localized risk with ~1-3h debug budget allocated.
