@@ -1142,31 +1142,27 @@ class CarlaEnv(gym.Env):
             tm.set_global_distance_to_leading_vehicle(2.5)
             tm.set_synchronous_mode(True)
             tm.set_random_device_seed(random.randint(0, 10000))
-            # Hybrid physics mode: NPCs outside a physics radius around the
-            # ego are advanced by TM without full physics simulation. Known
-            # CARLA 0.9.x fix for "NPCs frozen in sync mode" — without this,
-            # NPCs that spawn > ~50m from the ego can fall into a dormant
-            # state where the TM never issues them motion commands and they
-            # stand still for the whole episode. Radius 70m covers the full
-            # route-vicinity; NPCs outside that will also move, just without
-            # high-fidelity collisions (which don't matter for NPCs we never
-            # touch).
-            # Refs: carla-simulator#3860, #4030 docs on hybrid physics.
-            try:
-                tm.set_hybrid_physics_mode(True)
-                tm.set_hybrid_physics_radius(70.0)
-            except AttributeError:
-                # Older CARLA versions (<0.9.11) lack these; skip silently.
-                pass
-            # Confirm sync state after apply — diagnostic for the
-            # "traffic doesn't move" report. If synchronous_mode read-back
-            # disagrees with the True we just set, that's the bug.
+            # Hybrid physics mode DISABLED per issue #13 sanity-check results.
+            # Earlier theory was that hybrid_physics "prevents" frozen NPCs
+            # (based on misreading of CARLA issues #3860/#4030). Standalone
+            # sanity test (scripts/sanity_check_npcs.py v2) proved the
+            # opposite: hybrid_physics is the ROOT CAUSE of frozen NPCs
+            # across all 6 prior training runs. Results:
+            #   hybrid OFF, Town10HD_Opt:  avg 6.61 m/s, 10/10 moving  PASS
+            #   hybrid OFF, Town01:        avg 7.69 m/s, 10/10 moving  PASS
+            #   hybrid ON  + ego:          avg 1.56 m/s,  3/10 moving  FAIL
+            # TM stops issuing drive commands to vehicles outside the
+            # hero-radius, so they don't just lose physics — they fully
+            # freeze. With 30 NPCs on Town maps, the CPU cost of full
+            # physics is negligible; the agent gains actual dynamic traffic
+            # to train against.
+            # Confirm sync state after apply:
             try:
                 world_sync = self.world.get_settings().synchronous_mode
             except Exception:
                 world_sync = "?"
-            print(f"[TM] port={tm_port} sync_mode=True requested, "
-                  f"world.sync={world_sync} hybrid_physics=True radius=70m")
+            print(f"[TM] port={tm_port} sync_mode=True "
+                  f"world.sync={world_sync} hybrid_physics=OFF (issue #13 fix)")
 
             # Spawn vehicles
             vehicle_bps = self.blueprint_library.filter("vehicle.*")
