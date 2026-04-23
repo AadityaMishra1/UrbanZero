@@ -851,3 +851,81 @@ Append here when something changes materially.
   at fix-2 timestep ~700k (T+1h 40min). If triggered, remote Claude
   writes the BC paste-block; PC-side runs
   `scripts/run_bc_pipeline.sh --n_frames 150000 --epochs 30`.
+
+- **2026-04-23 ~01:55 Run-3 failed at 104k / 15min wall**. Same 5% RC
+  plateau. Beacon at 104k: rolling RC 4.03%, avg_speed 3.86 m/s,
+  policy_std 0.67 (clamp held — fix worked on std), COLLISION 52%,
+  OFF_ROUTE 41%, REALLY_STUCK 9%. Three failure modes persist across
+  all runs: "floor it off road," "creep and crash," "sit still."
+  User's key observation: **NPCs are visibly frozen in both CARLA
+  viewports despite `tm.set_hybrid_physics_mode(True)`.** Hybrid
+  physics alone did not fix NPC motion.
+
+- **Decision delegated to a no-prior-context subagent per user
+  instruction**. The subagent's verdict:
+  - DIAGNOSIS: Three issues compound. (i) Frozen NPCs contaminate the
+    reward signal — ~50% of COLLISION terminations are against
+    stationary NPCs/static geometry, not learnable collision
+    avoidance. (ii) At POTENTIAL_K=0.03, max |F|/step ≈ 0.021 =
+    max progress_reward/step → shaping can subsidize perpendicular
+    approach to the lookahead, a subtle Ng-compliant echo of the
+    7M-run circling attractor. (iii) Run-3 was judged at 104k steps
+    (Henderson 2018: unreliable pre-3M), but deadline math makes
+    that moot.
+  - DECISION: kill Run-3; launch Run-4 with POTENTIAL_K halved to
+    0.015 + NPC motion fix; in PARALLEL, run BC data collection on
+    the second CARLA server. Stop serializing fallbacks — hedge the
+    deadline by running both paths simultaneously.
+  - RULED OUT: adding a cos-heading shaping term (the 7M-run trap
+    holds; all documented failure modes started with "we added one
+    more shaping term"). If Run-4 fails with healthy std, bump
+    progress_reward 0.05→0.10 before touching shaping.
+
+- **NPC motion fix (issue #9)** — root cause per subagent analysis +
+  CARLA issues #3860/#4030/#6349:
+  1. `tm.global_percentage_speed_difference(-30.0)` — default is +30
+     (NPCs drive 30% BELOW limit). In zero-speed-limit zones (off-
+     road spawns, hybrid-dormant radius), 30% below 0 is 0. Negative
+     value forces NPCs to drive 30% ABOVE limit.
+  2. Per-vehicle `tm.vehicle_percentage_speed_difference(npc, -20.0)`,
+     `tm.auto_lane_change(npc, True)`, `tm.ignore_lights_percentage
+     (npc, 0.0)` — ensures each NPC has non-zero desired speed and
+     correct policy settings.
+  3. **`self.world.tick()` commit tick** after the spawn loop — in
+     sync mode, `set_autopilot()` enqueues registration asynchronously
+     in the TM; without a commit tick, the first env.step() can race
+     the TM's internal vehicle-registration table and leave NPCs
+     unregistered for one or more ticks. For long episodes this
+     manifests as "NPCs frozen the whole episode" because the race
+     loses deterministically under heavy PPO tick cadence.
+
+- **POTENTIAL_K 0.03 → 0.015**. Max |F|/step drops to ~0.0105,
+  progress_reward dominates shaping 2:1. Ng-compliance preserved
+  (F = γΦ'−Φ structure unchanged). Rationale: the perpendicular-
+  subsidy risk identified by the subagent — Φ reduces distance to
+  lookahead as ego approaches from ANY direction, so at peak
+  magnitude the shaping rewarded lateral approach just as well as
+  along-route motion. Halving K + keeping progress_reward at 0.05
+  restores the "drive forward on route" signal as strictly
+  dominant.
+
+- **Run-4 launch plan** (PC_CLAUDE_RUN4.md):
+  - Pane A: pure-RL on port 2000 ONLY, `URBANZERO_N_ENVS=1`, seed
+    311. Frees port 3000 for BC collection. Single env throughput
+    ~60 FPS but this is the decision-gate run, not the main
+    training run — if it passes gates, we scale back up.
+  - Pane B: `scripts/run_bc_pipeline.sh --port 3000 --n_frames
+    100000 --epochs 20` in parallel. Reduced from 150k/30 to fit
+    ~6h wall (collect 1.5h + BC train 2h + PPO-finetune option 2h).
+  - Gates: T+10min (`std ∈ [0.45, 0.70]`, avg_speed > 1.5 m/s,
+    user confirms NPCs moving in viewport), T+45min (RC ≥ 6%,
+    COLL% < 50, OFF_ROUTE% < 35), T+90min HARD DECISION
+    (RC < 8% → promote BC to primary; RC ≥ 8% → Run-4 continues).
+  - Seed 311 (runs used 42, 137, 211 previously).
+
+- **p(ship by deadline) = 0.62** per subagent. Decomposition:
+  p(Run-4 pure-RL succeeds) ≈ 0.30; p(BC pipeline produces demoable
+  checkpoint) ≈ 0.55; union with mild correlation ≈ 0.62. Critical
+  assumption: the NPC fix ACTUALLY fixes frozen NPCs. If Run-4's
+  T+10min check still shows NPCs frozen, immediately pivot to BC
+  (BehaviorAgent is rules-based and doesn't need moving NPCs).

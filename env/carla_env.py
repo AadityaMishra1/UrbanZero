@@ -654,7 +654,13 @@ class CarlaEnv(gym.Env):
     # gives a DENSE lateral-alignment gradient the critic can learn.
     # ------------------------------------------------------------------
     PPO_GAMMA = 0.99
-    POTENTIAL_K = 0.03
+    # Run-4 reduction: 0.03 → 0.015. At 0.03 the max |F|/step was ≈0.021,
+    # exactly matching max progress_reward per step. That meant shaping
+    # could subsidize any motion reducing dist-to-lookahead, including
+    # perpendicular-approach from off-route spawns — a subtle echo of
+    # the 7M-run circling attractor but Ng-compliant so invisible in
+    # asymptotic analysis. Halving K keeps progress_reward dominant 2:1.
+    POTENTIAL_K = 0.015
     LOOKAHEAD_ARC_M = 10.0
     DIST_CLAMP_M = 30.0
 
@@ -1117,6 +1123,44 @@ class CarlaEnv(gym.Env):
                     self.traffic_actors.append(npc)
                 except RuntimeError:
                     continue
+
+            # NPC motion enforcement (issue #9 fix). In CARLA 0.9.15 with
+            # sync mode + hybrid physics, NPCs frequently spawn with a zero
+            # desired speed because:
+            #   (a) global default percentage speed difference is +30%
+            #       (NPCs drive 30% BELOW speed limit); when evaluated
+            #       against a 0 speed-limit waypoint (e.g., off-road spawn
+            #       or hybrid-physics dormant zone), 30% below 0 is 0.
+            #   (b) set_autopilot() enqueues registration asynchronously
+            #       in the TM; without a commit tick, the very first
+            #       env.step() can race the TM's registration table and
+            #       leave NPCs unregistered for one or more ticks, which
+            #       looks like "frozen NPCs" for a short window that
+            #       sometimes extends to the whole episode.
+            # Fix: globally bias NPCs to drive ABOVE limit (so zero-limit
+            # zones still produce motion), set per-vehicle lane-change and
+            # light-ignore policy so they don't stop at red forever, then
+            # force one world tick to flush TM registration. Refs:
+            # carla-simulator#3860, #4030, #6349.
+            try:
+                tm.global_percentage_speed_difference(-30.0)
+            except Exception as e:
+                print(f"[TM] WARNING: global_percentage_speed_difference failed: {e}")
+            for npc in self.traffic_actors:
+                try:
+                    tm.vehicle_percentage_speed_difference(npc, -20.0)
+                    tm.auto_lane_change(npc, True)
+                    tm.ignore_lights_percentage(npc, 0.0)
+                except Exception:
+                    # Per-vehicle settings are best-effort; skip on
+                    # API-version mismatch or spawn-race.
+                    pass
+            try:
+                self.world.tick()
+            except Exception as e:
+                print(f"[TM] WARNING: commit tick after NPC spawn failed: {e}")
+            print(f"[TM] spawned {len(self.traffic_actors)} NPCs, "
+                  f"speed_diff=-30% global, committed via tick")
 
             # Spawn pedestrians
             ped_bps = self.blueprint_library.filter("walker.pedestrian.*")
