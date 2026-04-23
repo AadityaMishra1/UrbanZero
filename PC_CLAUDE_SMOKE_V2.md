@@ -1,47 +1,31 @@
 # PC-Side Claude — v2 Smoke Test Prompt
 
-**Date written:** 2026-04-22 (revised 3x after deploy-side failures)
+**Date written:** 2026-04-23 (revised 4x after deploy-side failures)
 **Branch:** `claude/setup-av-training-VetPV`
-**Tip commit:** `ddf0a8a` (fix(issue-4): inline per-worker spectator + cached TM + n_epochs 4->3)
-**Purpose:** 10-minute smoke test of a full reward/policy/obs/infra rewrite before committing to a long training run. Goal is to verify the new code boots at 4 parallel CARLA envs, populates the beacon, and does not fire any reward/NaN guards OR the deadlock pattern from issues #3/#4.
+**Tip commit:** `0a3f114` (revert infra to v1 (834a8e0) behavior, keep v2 experiment changes)
+**Purpose:** 10-minute smoke test of the v2 reward/obs/policy changes on TOP of v1's known-stable infrastructure. The 7M-step run used v1 infra at 2 envs with no special CARLA flags — this test reproduces exactly that infra setup and only layers the experiment changes on top.
 
 **Revisions to date:**
-1. First attempt: crashed with ENT_COEF_START UnboundLocalError (GitHub
-   issue #2). Fixed in commit 79374e5 alongside a post-audit fix-pack
-   (5 total bugs).
-2. Second attempt (4 envs): training completed 1 PPO iteration then
-   deadlocked (GitHub issue #3). Remote Claude initially diagnosed this
-   as GPU contention at 4-env scale and fell back to 2 envs.
-3. Third attempt (2 envs): ALSO deadlocked at iteration 3 (GitHub issue
-   #4), proving the 4-env/GPU-contention diagnosis wrong. Real root cause
-   identified via adversarial sub-agent audit with citations to CARLA's
-   own issue tracker:
-     - **CARLA #9172** (0.9.15-specific): lost-notify race in
-       `TrafficManagerLocal.cpp`, fires preferentially when tick cadence
-       slows. My v2 bumped `n_epochs=2→4`, doubling PPO's inter-rollout
-       gap and reliably triggering the race.
-     - **CARLA #1996 / #2239**: multi-client sync-mode contention. The
-       external `scripts/spectator.py` was a secondary client on port
-       2000, amplifying the race.
-     - **CARLA #2789**: `get_trafficmanager()` hang path from re-
-       registration under sync mode. v1 called this every reset.
+1. Attempt 1: crashed with ENT_COEF_START UnboundLocalError (issue #2).
+2. Attempt 2 (4 envs): deadlock at iter 1 (issue #3). Closed as "GPU contention" — that diagnosis was wrong.
+3. Attempt 3 (2 envs): deadlock at iter 3 (issue #4). The `world.tick(seconds=10.0)` timeout never fired — hang was elsewhere in step().
+4. Attempt 4 (2 envs, after adding TM-cache + inline spectator + n_epochs=3): deadlock at **iter 0** (issue #6). Those "fixes" made it worse.
 
-**What changed in this (3rd) revision:**
-- TrafficManager is now cached ONCE in env/carla_env.py `__init__`, not
-  re-registered per reset (closes #2789 path).
-- External scripts/spectator.py is NO LONGER auto-launched. Each CARLA
-  server window follows its OWN worker's ego via an inline spectator
-  transform update at the end of env/carla_env.py's `step()`. With 4
-  envs the user sees 4 CARLA windows each tracking its own agent —
-  NO external spectator process is needed.
-- All remaining `world.tick()` call sites now pass `seconds=10.0` (three
-  previously-unprotected sites fixed).
-- `n_epochs=4 → 3` (closer to the 7M run's proven-safe `n_epochs=2`,
-  shrinks the tick-gap that amplifies #9172 without fully giving up
-  the extra gradient).
-- Default `URBANZERO_N_ENVS` is back to **4**. The issue-#3 GPU-contention
-  diagnosis was wrong; root cause was the CARLA TM race + multi-client
-  contention, both now addressed.
+**Root-cause finding from the latest diff audit:**
+The earlier rounds of "fixes" layered multiple infrastructure changes
+(TM caching in `__init__`, inline `world.get_spectator()` RPC in every
+step, `seconds=10.0` timeout on every tick) on top of the experiment
+changes. v1 did NONE of those things and ran 7M steps clean. This
+revision removes ALL the infra changes and reverts to v1's exact
+infrastructure behavior. Only the experiment changes (reward / obs /
+policy hyperparameters) are kept.
+
+**What's in this revision (tip `0a3f114`):**
+- TrafficManager creation back in `_spawn_traffic()` per reset (v1 pattern)
+- No inline spectator in `step()` (gone)
+- `world.tick()` calls are BARE (no `seconds=10.0`)
+- Default `URBANZERO_N_ENVS` back to **2** (the 7M run's proven config)
+- Default CARLA launch flags: **no `-quality-level=Low`, no forced resolution** — just the port override. Matches what the user was doing on the 7M run.
 
 ---
 
@@ -99,36 +83,37 @@ Pull:
 
 Verify the current tip matches:
 
-  ddf0a8a fix(issue-4): inline per-worker spectator + cached TM + n_epochs 4->3
+  0a3f114 revert infra to v1 (834a8e0) behavior, keep v2 experiment changes
 
-If `ddf0a8a` is NOT the current HEAD, STOP and pull again. Running any
-earlier tip will hit one of the already-fixed bugs:
-  - before 79374e5 → crashes on ENT_COEF_START (issue #2)
-  - before ddf0a8a → deadlocks via CARLA TM race (issues #3 and #4)
+If `0a3f114` is NOT the current HEAD, STOP and pull again.
 
-Also verify the external spectator tmux session is NOT running from a prior
-attempt. If it is, kill it — the external spectator is what helped trigger
-the issue-#4 deadlock:
+Kill EVERY lingering process from prior attempts before starting. Stale
+processes and leaked CARLA state are a suspected contributor:
+
+  tmux kill-session -t urbanzero 2>/dev/null
+  tmux kill-session -t wd 2>/dev/null
   tmux kill-session -t spectator 2>/dev/null
-  # should either succeed or say "can't find session: spectator"
+  pkill -f "agents/train.py" 2>/dev/null
+  pkill -f "scripts/spectator.py" 2>/dev/null
+  pkill -f "scripts/watchdog.sh" 2>/dev/null
 
-If `scripts/spectator.py` is still alive as a Python process, kill that too:
-  pkill -f "python3 scripts/spectator.py" 2>/dev/null
+On the Windows side, ALSO kill every `CarlaUE4.exe` instance currently
+running before launching fresh ones (Task Manager → details → sort by
+name → end every CarlaUE4.exe process). Stale CARLA servers left over
+from hung prior runs may be in a corrupted sync-mode state.
 
 Make scripts executable:
   chmod +x scripts/preflight.py scripts/watchdog.sh scripts/start_training.sh
 
-=== STEP 2: verify 4 CARLA instances on Windows ===
+=== STEP 2: verify 2 CARLA instances on Windows ===
 
-This test uses FOUR Windows CARLA servers running on ports 2000, 3000,
-4000, and 5000. Prior issue-#3 attempt at 4 envs failed because of the
-CARLA-internal #9172 race, not because of GPU contention at this env
-count. The remote Claude's analysis + current fix pack (tip ddf0a8a)
-addresses that race, so 4 envs is expected to be viable now.
+This test uses TWO Windows CARLA servers, ports 2000 and 3000 — exactly
+the setup the user ran the prior 7M-step training on. Do NOT attempt
+4 envs; the 4-env attempt exhausted VRAM on the 4080 Super (issue #5).
 
 From WSL, verify each port:
 
-  for p in 2000 3000 4000 5000; do
+  for p in 2000 3000; do
     if timeout 3 bash -c ">/dev/tcp/172.25.176.1/$p" 2>/dev/null; then
       echo "port $p: UP"
     else
@@ -136,71 +121,48 @@ From WSL, verify each port:
     fi
   done
 
-If ALL FOUR ports are UP, proceed to STEP 3.
+If BOTH ports are UP, proceed to STEP 3.
 
-If any port is DOWN, STOP and paste the exact block below to the user.
+If either is DOWN, STOP and paste the exact block below to the user.
 Do NOT try to launch CARLA yourself from WSL — the paths and permissions
 are fragile, and a failed launch half-holds a port which makes debugging
 worse. The user runs these on the Windows side.
 
 --- paste to user verbatim ---
 
-"CARLA is not running on all four required ports (2000, 3000, 4000, 5000).
-Please open FOUR separate Windows PowerShell windows and run the commands
-below — one per window. Adjust the path if your CARLA install is somewhere
-other than `C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15`.
+"CARLA is not running on both required ports (2000 and 3000). Please
+kill any existing CarlaUE4.exe processes in Task Manager first (Details
+tab, sort by name, end every CarlaUE4.exe). Then open TWO separate
+Windows PowerShell windows and run the commands below — one per window.
 
-Launch them SEQUENTIALLY (wait ~20 seconds between each) — four simultaneous
-UE4 boots are stressful on a 4080 and any single failure during launch is
-harder to diagnose.
+Use the DEFAULT CARLA flags (no quality override, no forced resolution,
+no windowed flag). This matches exactly how the 7M-step run was launched
+that successfully trained for hours without deadlocks. Adjust the path
+if your CARLA install is somewhere other than
+`C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15`.
 
-After ALL FOUR instances have reached the pre-game menu (you'll see a
-CARLA logo and 'Press F1 for help' in each window), come back here and
-say 'ready'. Leave ALL four windows OPEN for the duration of the smoke
-test — closing one kills training on that worker. Each window will
-automatically follow its own worker's ego vehicle once training starts
-(inline spectator — no external spectator process needed).
+After both instances have reached the pre-game menu (you'll see a CARLA
+logo and 'Press F1 for help'), come back here and say 'ready'. Leave
+both windows OPEN for the duration of the smoke test — closing one
+kills training on that worker.
 
 Window 1 (port 2000):
   cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
-  .\\CarlaUE4.exe -carla-rpc-port=2000 -quality-level=Low -windowed -ResX=400 -ResY=300
+  .\\CarlaUE4.exe -carla-rpc-port=2000
 
 Window 2 (port 3000):
   cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
-  .\\CarlaUE4.exe -carla-rpc-port=3000 -quality-level=Low -windowed -ResX=400 -ResY=300
+  .\\CarlaUE4.exe -carla-rpc-port=3000
 
-Window 3 (port 4000):
-  cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
-  .\\CarlaUE4.exe -carla-rpc-port=4000 -quality-level=Low -windowed -ResX=400 -ResY=300
+If either instance fails to launch with 'server already running', a
+stale process is holding that port. Kill it in Task Manager and retry.
 
-Window 4 (port 5000):
-  cd C:\\Users\\aadit\\ECE-591\\CARLA_0.9.15\\WindowsNoEditor
-  .\\CarlaUE4.exe -carla-rpc-port=5000 -quality-level=Low -windowed -ResX=400 -ResY=300
-
-Flags explained:
-  -carla-rpc-port=<N>   : which port the CARLA server listens on (each
-                          trainer worker connects to one of these)
-  -quality-level=Low    : lowest render quality. Required at 4x concurrent
-                          instances on 16 GB VRAM. Training uses semantic
-                          seg not RGB, so render quality doesn't affect
-                          the agent's observations.
-  -windowed             : windowed mode, lets you see all four at once
-  -ResX=400 -ResY=300   : tiny windows. Reduces VRAM and CPU cost.
-
-If any instance fails to launch with 'server already running' or similar,
-that port is held by a stale process. Kill it in Task Manager (look for
-CarlaUE4.exe) and try again.
-
-Once all four are at the pre-game menu, reply 'ready'."
+Once both are at the pre-game menu, reply 'ready'."
 
 --- end paste ---
 
 After the user replies 'ready', re-run the port check loop. Do NOT proceed
-until all four ports report UP.
-
-If only 1-3 instances will launch (e.g., VRAM OOM on the 4th), STOP and
-report back with the VRAM usage shown on the CARLA console — the remote
-Claude may decide to downgrade to 3 envs for this run.
+until both ports report UP.
 
 === STEP 3: archive any prior experiment directory ===
 
@@ -219,13 +181,13 @@ Fresh run means fresh checkpoint dir. Prevent auto-resume ambiguity:
 === STEP 4: run preflight ===
 
   export URBANZERO_EXP=v2_rl
-  export URBANZERO_N_ENVS=4
+  export URBANZERO_N_ENVS=2
   export URBANZERO_BASE_PORT=2000
   python3 scripts/preflight.py
 
-Expected output: all 12 checks show [ OK ] (9 base checks + 3 extra
-"CARLA port NNNN" checks for ports 3000/4000/5000). If preflight FAILS,
-do NOT bypass it — paste the failure lines and STOP.
+Expected output: all 10 checks show [ OK ] (9 base checks + 1 extra
+"CARLA port 3000" check for the second env). If preflight FAILS, do
+NOT bypass it — paste the failure lines and STOP.
 
 === STEP 5: launch the smoke test ===
 
@@ -238,7 +200,7 @@ Kill any prior training/watchdog sessions first:
 Launch with SMOKE-TEST-SPECIFIC env vars:
 
   URBANZERO_EXP=v2_rl \
-  URBANZERO_N_ENVS=4 \
+  URBANZERO_N_ENVS=2 \
   URBANZERO_BASE_PORT=2000 \
   URBANZERO_TIMESTEPS=10000000 \
   URBANZERO_AUTO_RESUME=0 \
@@ -256,22 +218,30 @@ Attach briefly to confirm it started:
 
 You should see:
   - "=== UrbanZero Training ==="
-  - "  Envs: 4"
+  - "  Envs: 2"
   - "Device: cuda"
   - "Starting training for 10,000,000 timesteps..."
   - tqdm progress bar appearing
-  - Each CARLA window's camera snaps to a bird's-eye view over its
-    own Tesla ego (inline per-worker spectator — no external process)
 
 If the process dies in the first 60 seconds, paste the last 50 lines:
   LOG=$(ls -t ~/urbanzero/logs/v2_rl/train_*.log | head -1)
   tail -50 "$LOG"
 and STOP.
 
-Watch specifically for `world.tick() raised ...` messages. The new
-env/carla_env.py uses `world.tick(seconds=10.0)` at every tick site,
-so any CARLA hang surfaces as a logged RuntimeError within 10s instead
-of deadlocking silently (the failure mode from GitHub issues #3 and #4).
+If the process HANGS (no log output past iteration N, CARLA windows
+freeze) — as happened in issues #3/#4/#6 — capture diagnostics before
+killing it:
+
+  # Install py-spy once if not installed:
+  #   pip install py-spy
+  TRAINER_PID=$(pgrep -f "agents/train.py" | head -1)
+  # Dump stacks of the main process and all workers:
+  py-spy dump --pid $TRAINER_PID > /tmp/trainer_main.stack
+  for child in $(pgrep -P $TRAINER_PID); do
+      py-spy dump --pid $child > /tmp/trainer_worker_$child.stack
+  done
+  ls -la /tmp/trainer_*.stack
+  # Then paste the stack dumps in your report.
 
 === STEP 6: monitor for 10 minutes ===
 
@@ -295,16 +265,11 @@ Kill the session regardless of outcome:
 Then evaluate against these gates:
 
 PASS ALL to declare smoke-test green:
-  [P1] beacon "timesteps" >= 50000        (= aggregate >=83 FPS over 10 min)
-  [P2] beacon "fps" >= 90                 (4-env aggregate target; issue-#3
-                                           attempt at 4 envs measured 131
-                                           FPS before the deadlock fired,
-                                           so 90 is a conservative floor
-                                           that reflects both new per-step
-                                           overhead — inline spectator RPC,
-                                           TM caching — and expected gains
-                                           from removing the external
-                                           spectator contention)
+  [P1] beacon "timesteps" >= 40000        (= aggregate >=67 FPS over 10 min)
+  [P2] beacon "fps" >= 70                 (2-env aggregate floor; the 7M
+                                           run's prior 2-env measurement
+                                           was ~100 FPS at commit 747a28a,
+                                           so 70 is a conservative target)
   [P3] grep count NaN-GUARD == 0
   [P4] grep count reward-guard == 0
   [P5] beacon "cumulative_reward_clip_hits" == 0
@@ -318,19 +283,12 @@ PASS ALL to declare smoke-test green:
   [P8] beacon "approx_kl" is not None (SB3 has produced >=1 training pass)
 
 FAIL signals (any one means stop and triage, not "try again"):
-  [F1] fps < 70 aggregate: below the 4-env target. Report VRAM, GPU
-       util, and the CARLA window count. The remote side may drop to
-       3 envs. Do NOT change n_envs yourself.
-  [F1a] process hangs / no log output for >60s — same pattern as issues
-       #3 and #4. Should no longer happen at tip ddf0a8a (TM cached +
-       inline spectator + 10s tick timeouts), but if it does:
-         - Capture `py-spy dump --pid <trainer-pid>` if py-spy is
-           installed. Worth installing: `pip install py-spy` before
-           the test.
-         - Else capture `ps auxf | grep -E "train.py|CarlaUE4"`
-         - Grep log for any `world.tick() raised ...` messages. If
-           PRESENT, the timeout fired — that tells us which tick site.
-           If ABSENT, hang is elsewhere in the step pipeline.
+  [F1] fps < 50 aggregate at 2 envs: below the 7M run's ~100 FPS by
+       >50%. Report nvidia-smi VRAM, GPU util, CARLA window count.
+  [F1a] process hangs / no log output for >60s — capture py-spy stack
+       dumps for main + all workers as described in STEP 5 BEFORE
+       killing anything. Without those dumps we cannot tell where in
+       step() the hang is. Do NOT just kill and retry.
   [F2] any NaN-GUARD or reward-guard line in the log.
   [F3] beacon "termination_reasons" heavily dominated by one reason
        (>80%) within the first 50 episodes. Note: 80% REALLY_STUCK
@@ -350,8 +308,8 @@ Paste this EXACT template back to the user, filling in every slot:
 
   === v2 SMOKE TEST REPORT (10 min) ===
   tip commit: <git rev-parse HEAD>
-  CARLA ports: 2000/3000/4000/5000 UP: <yes/no>
-  n_envs used: 4
+  CARLA ports: 2000/3000 UP: <yes/no>
+  n_envs used: 2
   timesteps after 10 min: <n>
   aggregate FPS: <fps>
   policy_std: <value>
@@ -370,8 +328,8 @@ Paste this EXACT template back to the user, filling in every slot:
   <paste uniq -c output>
 
   PASS gates (P1..P8):
-  P1 >=50k timesteps : PASS / FAIL (<actual>)
-  P2 >=90 FPS        : PASS / FAIL (<actual>)
+  P1 >=40k timesteps : PASS / FAIL (<actual>)
+  P2 >=70 FPS        : PASS / FAIL (<actual>)
   P3 NaN=0           : PASS / FAIL (<actual>)
   P4 reward-guard=0  : PASS / FAIL (<actual>)
   P5 clip_hits=0     : PASS / FAIL (<actual>)
@@ -405,15 +363,15 @@ what broke the 7M run.
 
 - **Experiment name `v2_rl`.** This is a fresh namespace: checkpoints go to `~/urbanzero/checkpoints/v2_rl/`, logs to `~/urbanzero/logs/v2_rl/`. Your prior `shaped` / `phase1_notraffic` / `phase2_traffic` directories are untouched — you can still look at the old data if needed.
 
-- **Inline per-worker spectator.** Each of the 4 CARLA windows will follow its own worker's Tesla Model 3 automatically — the env/carla_env.py `step()` sets each server's spectator transform once per tick. You should see 4 bird's-eye views, each tracking a different ego. No `scripts/spectator.py` process is launched. If you want to spot-check which window is which worker, look at the CARLA window title (CARLA appends the RPC port to the title bar in 0.9.15).
+- **No inline spectator.** The per-worker spectator RPC I added earlier was reverted. Each CARLA window just shows whatever its default spectator camera is. If you want per-worker bird's-eye tracking for debugging, you can run `URBANZERO_SPECTATOR_PORT=2000 python3 scripts/spectator.py` in a separate tmux pane (and similarly for port 3000) — but don't do this during the smoke test; it was a contributor to the issue-#4 deadlock chain.
 
 - **The agent has a goal every episode.** The route pipeline was NOT changed in v2: each episode `reset()` still picks a destination spawn point 200-800 m away, traces a waypoint-by-waypoint route with CARLA's `GlobalRoutePlanner`, and feeds the next 3 waypoints into the agent's state vector. The reward is the projection of ego motion onto that route, and ROUTE_COMPLETE (+50) fires when the ego reaches the final waypoint with speed < 3 m/s. What I changed in v2 was the *reward scale and shape*, not what the agent is trying to do.
 
-- **Why 10 minutes and not 30.** The smoke test isn't trying to learn anything. It's proving the new stack doesn't crash, achieves target FPS on 4 envs, populates the new telemetry correctly, AND most importantly survives past iteration 3-4 where the issue-#4 deadlock used to fire. At 4 envs, `n_steps=256`, so a PPO rollout/train cycle is every `256 * 4 = 1024` env-steps. 10 minutes at 90+ FPS = ~54k env-steps = ~53 PPO iterations. If the deadlock pattern is truly dead, it will not recur in this window.
+- **Why 10 minutes and not 30.** The smoke test isn't trying to learn anything. It's proving the new stack doesn't crash, reaches target FPS on 2 envs, populates the new telemetry correctly, and most importantly survives past iteration 3 where the issue-#4 deadlock used to fire. At 2 envs, `n_steps=512`, so a PPO rollout+train cycle is every `512 * 2 = 1024` env-steps. 10 minutes at 70+ FPS = ~42k env-steps ≈ 41 PPO iterations. If the revert cured the deadlock, it will not recur in that window.
 
-- **What happens if smoke test FAILS gate F1 (FPS too low).** Drop to 3 envs — i.e. shut down the CARLA instance on port 5000, set `URBANZERO_N_ENVS=3`, and re-run the smoke test. At 3 envs we lose ~25% sample diversity but VRAM pressure drops substantially.
+- **What happens if smoke test FAILS gate F1 (FPS too low at 2 envs).** That's unexpected — the 7M run measured ~100 FPS at exactly this config. Report nvidia-smi, GPU util, CARLA window count, and any `[reset] world.tick() raised` lines in the log.
 
-- **What happens if smoke test FAILS gate F1a (hang despite the fixes).** That would mean CARLA #9172 fired anyway or some other deadlock source we haven't identified. The `world.tick(seconds=10.0)` timeouts I added should at least surface which tick site is blocking; look for `world.tick() raised` lines in the log and paste whatever does appear. If the log is truly silent, the hang is not in a tick call — it's in `apply_batch_sync`, a sensor dispatcher, or the SubprocVecEnv pipe, and we'll need the `py-spy dump` to find it.
+- **What happens if smoke test FAILS gate F1a (hang).** Capture `py-spy dump` for main + all workers BEFORE killing anything (commands in the PC-side prompt's STEP 5). Without those stacks we can't tell where in step()/reset()/init the hang is, and every retry without them is blind. py-spy install: `pip install py-spy`. Paste the full stack dumps in the report.
 
 - **What happens if smoke test FAILS gate F2 (NaN/reward-guard fires).** That's a code bug on the remote side. Paste the report back and I will investigate immediately.
 
