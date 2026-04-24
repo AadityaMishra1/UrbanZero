@@ -188,6 +188,8 @@ hyperparameter schedule used in every run of this paper.
 
 \textbf{RL evaluation rigor.} Henderson~et~al.~\cite{henderson} show
 that RL results drawn before $\sim$3M clean steps are unreliable.
+Schulman~et~al.~\cite{gae} provide the GAE formulation
+($\lambda = 0.95$, $\gamma = 0.99$) used by every run in this paper;
 Pardo~et~al.~\cite{pardo} give the correct GAE bootstrap under
 episode truncation (e.g., our \texttt{REALLY\_STUCK} truncation).
 Engstrom~et~al.~\cite{engstrom} show that PPO implementation
