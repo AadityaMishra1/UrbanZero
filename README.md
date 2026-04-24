@@ -31,9 +31,9 @@ Critical context, in priority order:
    citations.
 5. **GitHub Issues #1-#13** — per-iteration data + diagnostics.
    Issue #13 (closed) documents the root cause discovery.
-6. **`PC_CLAUDE_FINAL_BC_EVAL.md`** + other `PC_CLAUDE_*.md` —
-   the paste blocks used to direct the PC-side agent that ran
-   training/eval (historical record of the iteration loop).
+6. **`docs/history/PC_CLAUDE_*.md`** — the paste blocks used to
+   direct the PC-side agent that ran training/eval (historical
+   record of the iteration loop, kept for journey documentation).
 
 The remaining work to ship the course deliverable is in the
 "What's Outstanding" section below.
@@ -140,7 +140,7 @@ UrbanZero/
 ├── run.sh                    # Single-pane launcher (training + ROS + tensorboard)
 ├── PROJECT_NOTES.md          # ★ Scientific memory — every failure documented
 ├── DIAGNOSIS_FOR_REVIEW.md   # Self-contained writeup for external review
-├── PC_CLAUDE_*.md            # Iterative paste blocks used to direct PC-side
+├── docs/history/PC_CLAUDE_*.md  # Iterative paste blocks used to direct PC-side
 │                              # agent during training/eval (historical record)
 └── README.md                 # this file
 ```
@@ -166,7 +166,7 @@ UrbanZero/
 3. Output JSON has the same shape as `eval/bc_final_20260424_0059.json`.
 
 For full training reproduction (data collection → BC training → eval),
-see the run history in `git log` and the `PC_CLAUDE_*.md` paste blocks.
+see the run history in `git log` and the `docs/history/PC_CLAUDE_*.md` paste blocks.
 
 ## ROS Integration
 
@@ -263,7 +263,7 @@ For an agent picking up this repo to ship the deliverables:
 | **Paper draft (6-8 page IEEE LaTeX)** | 4-6h | source: `PROJECT_NOTES.md` + `eval/bc_final_20260424_0059.json` |
 | **3-4 figures** | 1-2h | matplotlib from beacon JSON in issues #7-#13 + final eval JSON |
 | **3-min video** | 2-3h | OBS / QuickTime screen capture + voiceover |
-| **Final repo polish** | 30 min | clean up old `PC_CLAUDE_*.md` if desired |
+| **Final repo polish** | 30 min | already moved to `docs/history/` |
 
 ### Suggested figures (with data sources)
 
