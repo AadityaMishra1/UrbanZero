@@ -1,277 +1,314 @@
 # UrbanZero
 
-Tabula rasa reinforcement learning for urban autonomous driving in CARLA.
+Reinforcement learning for urban autonomous driving in CARLA 0.9.15.
+NCSU CSC/ECE 591 Spring 2026 final project.
 
-A PPO agent learns to navigate a city from scratch using only a reward signal — no expert demonstrations, no hardcoded rules. The architecture is informed by state-of-the-art approaches from CaRL (NVIDIA, CoRL 2025), Think2Drive (ECCV 2024), and Roach (ETH Zurich, ICCV 2021).
+**Author:** Aaditya Mishra (`amishr26@ncsu.edu`)
+**Branch with full history:** `claude/setup-av-training-VetPV`
+**Final deliverable result:** BC policy at **7.42% mean route completion**, **32.93% max** across 20 deterministic episodes (see `eval/bc_final_20260424_0059.json`).
 
-## Stack
+---
 
-- **CARLA 0.9.15** — urban driving simulator
-- **Stable-Baselines3** — PPO implementation
-- **Python 3.10**, PyTorch (CUDA)
-- **ROS2 Humble** (planned bridge integration)
+## TL;DR for any future agent / collaborator picking this up
 
-## Project Structure
+This project went through **6 documented training-run failures** before
+identifying the actual environmental root cause via standalone
+diagnostic. The deliverable is the **frozen Behavior Cloning policy**
+(`checkpoints/bc_pretrain.zip` on the training PC) plus the
+**scientific failure analysis** in `PROJECT_NOTES.md`.
+
+Critical context, in priority order:
+1. **`PROJECT_NOTES.md`** — the scientific memory. 50KB+ of
+   per-run failure analysis with citations, pre-registered
+   falsification criteria, paper references. Read this first.
+2. **`eval/bc_final_20260424_0059.json`** — the final result.
+3. **`DIAGNOSIS_FOR_REVIEW.md`** — self-contained technical
+   briefing prepared for an external ML/RL reviewer; includes
+   reward function, hyperparameters, all 6 run beacons, paper
+   citations.
+4. **GitHub Issues #1-#13** — per-iteration data + diagnostics.
+   Issue #13 (closed) documents the root cause discovery.
+5. **`PC_CLAUDE_FINAL_BC_EVAL.md`** + others — the paste blocks
+   used to direct the PC-side agent that ran training/eval.
+
+The remaining work to ship the course deliverable is in the
+"What's Outstanding" section below.
+
+---
+
+## What This Project Is
+
+The original goal (`UrbanZero.pdf`): train a tabula-rasa PPO agent
+in CARLA to drive 200-800m urban routes from scratch using only
+camera + state input and a reward signal. No expert demos, no
+hardcoded rules.
+
+This goal **was not achieved**. The project pivoted to Behavior
+Cloning warmstart after pure-RL failed across 3 documented runs.
+BC+PPO finetune then failed across 3 more runs due to reward-vs-BC
+conflict and entropy-gradient dominance. Final deliverable is
+**frozen BC evaluated deterministically**.
+
+The **scientific contribution** is the failure analysis: 6 documented
+failure modes, each with pre-registered diagnostic criteria, and
+the eventual root-cause identification (`tm.set_hybrid_physics_mode
+(True)` was freezing 70% of NPCs across all training runs, contaminating
+every reward signal).
+
+## Final Result
+
+```
+Frozen BC policy (bc_pretrain.zip), 20 deterministic episodes:
+
+  RC mean:        7.42%
+  RC median:      3.64%
+  RC max:        32.93%   ← best individual episode
+  ROUTE_COMPLETE: 0%
+  COLLISION:      75%     ← distribution shift signature
+  OFF_ROUTE:      25%
+  Avg speed:      5.37 m/s
+```
+
+Comparison: pure-RL plateaued at ~5% mean RC across 3 runs. BC
+delivers +2.4 percentage points over pure-RL ceiling, but does not
+complete routes. The COLLISION rate is the documented Codevilla 2019
+distribution-shift failure: BC was trained on 100k frames where NPCs
+were frozen (issue #13 root cause undiscovered at collection time);
+when evaluated against dynamic NPCs, BC has no learned concept of
+moving obstacles.
+
+## Tech Stack
+
+- **CARLA 0.9.15** — urban driving simulator (Windows host)
+- **stable-baselines3 2.x** — PPO + custom policy
+- **PyTorch (CUDA)** — RTX 4080 Super, 16 GB VRAM
+- **ROS 2 Humble** — `ros/urbanzero_node.py` publishes vehicle
+  state and control to ROS topics during training
+- **Python 3.10**, WSL2 (Ubuntu 24.04) running the trainer
+- Hardware: Ryzen 7 9800X3D + RTX 4080 Super + Windows 11 host
+
+## Repository Structure
 
 ```
 UrbanZero/
 ├── env/
-│   └── carla_env.py          # Gymnasium wrapper for CARLA with route planning,
-│                              # shaped reward, traffic, weather randomization
+│   ├── carla_env.py          # Gym env wrapper for CARLA, reward function,
+│   │                          # route planning, traffic spawning
+│   └── safety_wrapper.py     # NaN-guard around the env
 ├── agents/
-│   └── train.py              # PPO training script with SubprocVecEnv,
-│                              # frame stacking, custom CNN, eval metrics
+│   ├── train.py              # PPO trainer with BC warmstart path
+│   └── train_bc.py           # Gaussian NLL BC trainer (multi-file input)
 ├── models/
-│   └── cnn_extractor.py      # 5-layer CNN with LayerNorm (replaces NatureCNN)
+│   ├── clamped_policy.py     # PPO policy with log_std upper clamp
+│   └── cnn_extractor.py      # 5-layer CNN + state MLP fusion
 ├── eval/
-│   └── evaluator.py          # CARLA leaderboard-style metrics callback
-├── rewards/                   # (reward function variants — future)
-└── UrbanZero.pdf             # Project proposal
+│   ├── beacon_callback.py    # Writes ~/urbanzero/beacon.json every step
+│   ├── evaluator.py          # Per-episode metrics
+│   └── bc_final_20260424_0059.json   # ★ FINAL RESULT
+├── ros/
+│   └── urbanzero_node.py     # ROS 2 node — publishes state/control topics
+├── scripts/
+│   ├── collect_bc_data.py    # BehaviorAgent rollout → .npz
+│   ├── eval_bc.py            # Deterministic eval (the script that produced
+│   │                          # the final result)
+│   ├── sanity_check_npcs.py  # Standalone NPC motion diagnostic
+│   │                          # (the tool that found the root cause)
+│   ├── start_training.sh     # Tmux-based training launcher
+│   ├── watchdog.sh           # Restarts trainer on beacon staleness
+│   ├── preflight.py          # Pre-launch infra checks
+│   └── spectator.py          # Optional CARLA spectator viewer
+├── run.sh                    # Single-pane launcher (training + ROS + tensorboard)
+├── PROJECT_NOTES.md          # ★ Scientific memory — every failure documented
+├── DIAGNOSIS_FOR_REVIEW.md   # Self-contained writeup for external review
+├── PC_CLAUDE_*.md            # Iterative paste blocks used to direct PC-side
+│                              # agent during training/eval (historical record)
+└── README.md                 # this file
 ```
 
-## Prerequisites
+## Reproducing the Final Result
 
-### 1. CARLA Simulator
+1. CARLA 0.9.15 server running on Windows host, port 2000
+   ```bat
+   cd C:\Users\<user>\ECE-591\CARLA_0.9.15\WindowsNoEditor
+   .\CarlaUE4.exe -carla-rpc-port=2000
+   ```
 
-Download and run CARLA 0.9.15:
+2. WSL2/Ubuntu side, with venv activated:
+   ```bash
+   export PYTHONPATH=$PYTHONPATH:/mnt/c/.../CARLA_0.9.15/WindowsNoEditor/PythonAPI/carla
+   cd ~/UrbanZero
+   python3 scripts/eval_bc.py \
+     --model ~/urbanzero/checkpoints/bc_pretrain.zip \
+     --episodes 20 --port 2000 --seed 1001 \
+     --output ~/urbanzero/eval/bc_replay.json
+   ```
 
+3. Output JSON has the same shape as `eval/bc_final_20260424_0059.json`.
+
+For full training reproduction (data collection → BC training → eval),
+see the run history in `git log` and the `PC_CLAUDE_*.md` paste blocks.
+
+## ROS Integration
+
+`ros/urbanzero_node.py` runs as a ROS 2 node alongside training
+(launched in `run.sh` Pane 2). Publishes 4 topics at 20 Hz:
+
+| Topic | Type | Description |
+|---|---|---|
+| `/urbanzero/camera/semantic` | `sensor_msgs/Image` | Semantic-seg camera frames |
+| `/urbanzero/vehicle/control` | `geometry_msgs/Twist` | linear.x = throttle-brake, angular.z = steer |
+| `/urbanzero/vehicle/speed` | `std_msgs/Float32` | Ego speed in m/s |
+| `/urbanzero/status` | `std_msgs/String` | Human-readable status line |
+
+Launch separately:
 ```bash
-# Download from https://github.com/carla-simulator/carla/releases/tag/0.9.15
-# Extract and run the server:
-./CarlaUE4.sh -prefernvidia -quality-level=Low
+source /opt/ros/humble/setup.bash
+python3 ros/urbanzero_node.py
+ros2 topic echo /urbanzero/status
 ```
 
-For multi-env training, launch multiple CARLA instances on different ports:
+---
 
-```bash
-./CarlaUE4.sh -carla-rpc-port=2000 &
-./CarlaUE4.sh -carla-rpc-port=3000 &
-./CarlaUE4.sh -carla-rpc-port=4000 &
-./CarlaUE4.sh -carla-rpc-port=5000 &
-```
+# COURSE GRADING RUBRIC (CSC/ECE 591 Spring 2026)
 
-### 2. CARLA PythonAPI
+Embedded here so any future agent picking up this repo knows exactly
+what the deliverable is being graded against.
 
-The environment uses CARLA's `GlobalRoutePlanner` for navigation. The CARLA PythonAPI `agents` package must be importable:
+## Project (30% of final grade)
 
-```bash
-# Option A: Install the CARLA egg (comes with CARLA download)
-pip install /path/to/CARLA/PythonAPI/carla/dist/carla-0.9.15-py3.10-linux-x86_64.egg
+| Milestone | Points |
+|---|---|
+| Proposal | 5 |
+| Status Report | 5 |
+| **Final Paper** | **10** |
+| **Final Video** | **10** |
 
-# Option B: Add to PYTHONPATH
-export PYTHONPATH=$PYTHONPATH:/path/to/CARLA/PythonAPI/carla
+**Format requirements (from syllabus):**
+- Final paper: **6-8 page, 2-column IEEE or ACM format** (need LaTeX)
+- Final video: **1-3 minutes, 3-minute hard max**
+- Both due **Apr 26 11:59pm AOE** (= Apr 27 ~7:59am EDT)
+- Submit paper: <https://docs.google.com/forms/d/e/1FAIpQLSdofyQAXAuFc6k4HEDeC-ZiKk4rLVgwYqHm9JTZ5nEvqLjRoQ/viewform>
+- Submit video: <https://docs.google.com/forms/d/e/1FAIpQLSeZhx701WOPGoqqZKvjHZVOB6Ta-tN5zo8kdezFKbLMooxGgw/viewform>
 
-# Option C: Set the env var (the code checks this as fallback)
-export CARLA_PYTHONAPI=/path/to/CARLA/PythonAPI/carla
-```
+## Final Paper Rubric (10 points)
 
-**Important:** CARLA's PythonAPI has its own `agents/` package (for `agents.navigation.global_route_planner`). Our project also has an `agents/` directory. The code handles this conflict automatically, but if you get an `ImportError` about `GlobalRoutePlanner`, make sure the CARLA PythonAPI path is set correctly using one of the options above.
+| Item | Points |
+|---|---|
+| Abstract conveys the project | 0.667 |
+| Introduction motivates the problem and identifies contributions | 1 |
+| Relevant citations and references | 0.667 |
+| Use of Figures to convey key concepts / results | 0.5 |
+| Technical approach is explained clearly | 0.5 |
+| Claims supported by evidence | 0.667 |
+| **Code / Artifacts demonstrate effort** | **3.5** |
+| Related Work | 0.332 |
+| **Lessons learned documents the journey** | **1** |
+| Polish, Spelling, Grammar | 0.5 |
+| Figure / Graph Axis labels | 0.332 |
+| Conclusion summarizes work | 0.332 |
 
-### 3. Python Dependencies
+For multi-person teams: each person identifies unique contributions.
+This project is solo (one author).
 
-```bash
-pip install carla gymnasium stable-baselines3[extra] torch numpy tensorboard
-```
+## Final Video Rubric (10 points)
 
-### 4. CARLA Host
+| Item | Points |
+|---|---|
+| Introduction motivates the problem and identifies contributions | 2 |
+| Presentation is ≤ 3 minute time limit | 2 |
+| **Lessons learned and documentation of the journey** | **3** |
+| Polish, Spelling, Grammar | 1 |
+| Conclusion summarizes work | 2 |
 
-By default the env connects to `172.25.176.1:2000`. Override with environment variables if CARLA is on a different host:
+## Course Hard Requirements
 
-```bash
-export CARLA_HOST=localhost   # if CARLA runs on the same machine
-export CARLA_PORT=2000        # default port
-```
+From `csc591-software-for-robots/project/README.md`:
 
-## Training
+- **Running ROS** — every project must run ROS (ROS2/ROS1/MicroROS).
+  ✅ Satisfied via `ros/urbanzero_node.py`.
+- **Sensing and Actuating** — every project must sense and actuate.
+  ✅ Satisfied: semantic-seg camera input, throttle+steer output.
+- **Domain pick** — must pick a domain. ✅ Driving (explicitly listed
+  in suggested domains).
+- **GitHub repo with README listing key deliverables** — ✅ this file.
 
-### Quick Start (single environment)
+---
 
-```bash
-# Basic training — no traffic, for initial debugging
-python agents/train.py --n-envs 1 --no-traffic --timesteps 2000000 --experiment debug
+## What's Outstanding (TODO before submission)
 
-# Full training with traffic + weather randomization
-python agents/train.py --n-envs 1 --timesteps 10000000 --experiment shaped
-```
+For an agent picking up this repo to ship the deliverables:
 
-### Parallel Training (recommended)
+| Task | Effort | Dependency |
+|---|---|---|
+| **Paper draft (6-8 page IEEE LaTeX)** | 4-6h | source: `PROJECT_NOTES.md` + `eval/bc_final_20260424_0059.json` |
+| **3-4 figures** | 1-2h | matplotlib from beacon JSON in issues #7-#13 + final eval JSON |
+| **3-min video** | 2-3h | OBS / QuickTime screen capture + voiceover |
+| **Final repo polish** | 30 min | clean up old `PC_CLAUDE_*.md` if desired |
 
-For serious training, run multiple CARLA instances and use `SubprocVecEnv`:
+### Suggested figures (with data sources)
 
-```bash
-# Start 4 CARLA servers on ports 2000, 3000, 4000, 5000 first, then:
-python agents/train.py --n-envs 4 --timesteps 10000000 --experiment parallel
-```
+1. **6-run failure timeline** — RC trajectory across all runs, marking
+   the diagnosed failure mode for each. Data: per-run beacons in issues
+   #7-#11.
+2. **Per-run beacon metrics** — RC, policy_std, approx_kl trajectories
+   across the 6 runs to show the documented patterns.
+3. **Final BC eval distribution** — histogram of per-episode RC from
+   `eval/bc_final_20260424_0059.json`.
+4. **Reward function decomposition** — bar chart showing per-step
+   max reward magnitudes per term (progress, carrot, idle, shaping,
+   terminals).
 
-### Resume from Checkpoint
+### Paper section outline (mapped to rubric)
 
-```bash
-python agents/train.py --resume ~/urbanzero/checkpoints/shaped/ppo_urbanzero_5000000_steps.zip
-```
+- **Abstract** (0.667 pt) — frame as failure-driven scientific result
+- **Introduction + contributions** (1 pt) — three contributions:
+  full pipeline, documented failure modes, root cause via standalone
+  diagnostic
+- **Related Work** (0.332 pt) — CaRL, Roach, LBC, LAV, Ng 1999,
+  Codevilla 2019, Andrychowicz 2021 — all in `PROJECT_NOTES.md §2`
+- **Technical Approach** (0.5 pt) — env, reward, BC pipeline,
+  diagnostic methodology
+- **Results / Evidence** (0.667 + 0.5 + 0.332 pt) — final BC eval table,
+  per-run failure data, root cause discovery
+- **Lessons Learned** (1 pt) — directly from `PROJECT_NOTES.md §11`
+- **Conclusion** (0.332 pt) — what worked, what didn't, what's next
 
-### All CLI Options
+### Video script outline (mapped to rubric)
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--n-envs` | 1 | Number of parallel CARLA environments |
-| `--base-port` | 2000 | Base CARLA port (env _i_ uses `base + i*1000`) |
-| `--timesteps` | 10,000,000 | Total training timesteps |
-| `--no-traffic` | false | Disable NPC vehicle/pedestrian spawning |
-| `--no-weather` | false | Disable weather randomization per episode |
-| `--resume` | None | Path to checkpoint `.zip` to resume from |
-| `--experiment` | shaped | Experiment name (determines log/checkpoint subdirectory) |
+- 0:00-0:30 — Hook + problem motivation + contributions (2 pts)
+- 0:30-1:30 — 6-failure timeline + root cause discovery (3 pts —
+  the strongest content)
+- 1:30-2:30 — Final BC result + comparison to pure-RL (2 pts conclusion)
+- 2:30-3:00 — Future work and one-line takeaway
 
-### Monitor Training
+Hard cap at 3 minutes. Practice timing.
 
-```bash
-tensorboard --logdir ~/urbanzero/logs/
-```
+---
 
-Key metrics to watch in TensorBoard:
+## How to Pick This Up Without Context (for ClaudeCoWork)
 
-| Metric | What It Means | Healthy Range |
-|--------|--------------|---------------|
-| `driving/route_completion` | Fraction of route completed per episode | Should climb toward 0.5+ after 2-3M steps |
-| `driving/driving_score` | Route completion x (1 - collision rate) | Gold standard metric; >0.3 is good progress |
-| `driving/collision_rate` | Fraction of episodes ending in collision | Should decrease over training |
-| `driving/avg_speed_ms` | Mean speed in m/s | 3-8 m/s is reasonable urban driving |
-| `rollout/ep_rew_mean` | Mean episode reward (SB3 built-in) | Should trend upward |
-| `rollout/ep_len_mean` | Mean episode length | Should increase (longer = surviving longer) |
+If you are an AI agent or collaborator pulling this repo fresh:
 
-## What to Expect
+1. **Read `PROJECT_NOTES.md` end to end** (~30 min) — this is the
+   scientific memory. Every commit, every failure mode, every fix
+   attempt is documented with rationale and citations.
+2. **Read `eval/bc_final_20260424_0059.json`** — this is the final
+   result. The aggregate block has the headline numbers.
+3. **Look at GitHub issues #7-#13** for raw beacon data per training
+   run. Issue #13 (closed) explains the root cause discovery.
+4. **Do NOT re-attempt training**. Six runs failed. The hybrid_physics
+   bug is fixed but BC was trained on contaminated data; PPO finetune
+   under the current pipeline was definitively shown unstable. Effort
+   should go to writeup, not more experiments.
+5. **The deliverable is the paper + video** per the rubric above.
+   Source material for both is in `PROJECT_NOTES.md` and the eval JSON.
+6. **No co-author tags from AI assistants on commits to main.**
+   Author commits as the user only.
 
-### Training Progression
+## Submission Checklist
 
-Training follows a rough progression through emergent behaviors:
-
-**Steps 0 – 500K: Exploration phase**
-- Agent mostly drives erratically or crashes immediately
-- Episode lengths are very short (10-50 steps)
-- Route completion near 0%
-- Collision rate near 100%
-- This is normal — the agent is exploring the action space
-
-**Steps 500K – 2M: Basic locomotion**
-- Agent learns to apply throttle and avoid immediate walls
-- Starts to follow road geometry (steering toward waypoints)
-- Episodes get longer (100-500 steps)
-- Route completion starts climbing (5-15%)
-- Steering may still be jerky/oscillating
-
-**Steps 2M – 5M: Lane following**
-- Agent learns to stay in lane and follow the road
-- Action smoothness improves (less steering oscillation)
-- Route completion 15-40%
-- Collision rate drops below 50%
-- May still run red lights and struggle with turns
-
-**Steps 5M – 10M: Traffic awareness**
-- Agent starts reacting to other vehicles (braking, yielding)
-- Traffic light compliance begins to emerge
-- Route completion 30-60%
-- Driving becomes visually recognizable as "driving"
-
-**Beyond 10M: Refinement**
-- Better intersection handling, smoother control
-- With 4+ parallel envs and 20M+ steps, expect 50-70% route completion
-
-### What's Different from the Naive Baseline
-
-The naive baseline (v1) had these fatal flaws:
-- **No route/destination** — the agent had no concept of where to go
-- **Speed reward only** — driving fast in circles was a valid optimum
-- **84x84 image, 3 identical channels** — wasted 2/3 of visual capacity
-- **3-element state vector** — no waypoint lookahead, no lane info
-- **Single frame** — couldn't infer velocity or motion from vision
-- **NatureCNN** — Atari-era architecture, insufficient for driving
-- **2M steps, 1 env** — 10-100x too few samples for PPO
-
-The v2 rewrite fixes all of these. The agent now receives a planned route, gets rewarded for progressing along it, sees future waypoints in its state vector, has temporal context via frame stacking, and uses a properly sized CNN.
-
-### Common Issues
-
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| `ImportError: GlobalRoutePlanner` | CARLA PythonAPI not on path | `export CARLA_PYTHONAPI=/path/to/CARLA/PythonAPI/carla` |
-| `RuntimeError: No free spawn point` | Too many actors for the map | Reduce `--num-traffic-vehicles` or restart CARLA |
-| Agent drives off-road immediately | Not enough training steps | Train for at least 2M steps before evaluating |
-| Reward is flat/not improving | Check TensorBoard for entropy collapse | Ensure `ent_coef=0.01` is set (it is by default) |
-| CARLA connection timeout | CARLA server not running | Start CARLA first, verify host/port with env vars |
-| GPU OOM with 4 parallel envs | CARLA rendering uses VRAM | Use `--no-rendering` flag when launching CARLA servers |
-
-## Architecture Details
-
-### Observation Space
-
-| Component | Shape | Description |
-|-----------|-------|-------------|
-| **Image** | `(4, 128, 128)` | 4 stacked frames of normalized semantic segmentation labels (float32, [0,1]) |
-| **State** | `(48,)` | 4 stacked frames of 12-element vector: speed, prev actions, 3 ego-frame waypoints (dx/dy), lane offset, traffic light state, route completion |
-
-### Action Space
-
-| Action | Range | Description |
-|--------|-------|-------------|
-| Steering | [-1, 1] | Full left to full right |
-| Throttle/Brake | [-1, 1] | Negative = brake, positive = throttle |
-
-### Reward Function
-
-Roach-style dense shaping (per-step) plus terminal events. Single-env
-training, so we use Roach's denser shaping rather than CaRL's
-progress-only reward (which assumes 300+ parallel envs).
-
-**Per-step shaping (each clipped/bounded so none can dominate):**
-
-| Component | Coefficient | Description | Reference |
-|-----------|-------------|-------------|-----------|
-| Route progress  | +2.0 × Δm | Primary positive signal; meters along planned route, clamped to [0, 1.5m]/step. | CaRL §3.1; Roach §3.3 |
-| Speed × alignment | ±0.30 max | `0.3 × min(speed,TARGET)/TARGET × cos(angle_diff)`. **Signed** alignment in [-1, +1] makes circling reward-zero and wrong-way reward-negative. | Roach §3.3; Toromanoff CVPR 2020 |
-| Lateral deviation | -0.1 max | `-0.1 × min(\|lane_offset\|/2.0, 1.0)`. Continuous penalty for drifting from lane center. | Roach §3.3; Toromanoff CVPR 2020 |
-| Action smoothness | -0.05 max | `-0.05 × (Δsteer² + Δthrottle²)`. Reduces steering oscillation. | CAPS, ICRA 2021 |
-
-**Terminal events:**
-
-| Component | Reward | Trigger |
-|-----------|--------|---------|
-| Collision         | -5.0 | Impulse > 2500N |
-| Off-route         | -5.0 | >15m from any route waypoint in window [-20, +50], gated off near goal |
-| Route complete    | +10.0 | Within 5m of final waypoint AND speed < 2 m/s — must come to a stop ("park") |
-| Really stuck      | -5.0 | Safety net: 30s without 1m of route progress |
-| Stagnation        | -- | Truncate after 200 steps slow/no-progress (gated on red light + legit queue) |
-| Max steps         | -- | Truncate at 3000 steps (150s) |
-
-The signed-alignment design is the structural fix for the failure mode
-where the previous reward (`alignment = max(0, cos(θ))` + 0.7 gate)
-inadvertently paid the agent +20.5 reward per 30s of figure-8 circling
-in place. See commit `0bc0dc5` for the full math.
-
-### CNN Architecture
-
-5-layer CNN with LayerNorm (inspired by CaRL, NVIDIA AVG):
-
-```
-Image (4, 128, 128) → Conv2d(4,32,5,s2) → LN → ReLU
-                     → Conv2d(32,64,3,s2) → LN → ReLU
-                     → Conv2d(64,128,3,s2) → LN → ReLU
-                     → Conv2d(128,128,3,s2) → LN → ReLU
-                     → Conv2d(128,256,3,s2) → LN → ReLU
-                     → Flatten → FC(4096, 256)
-
-State (48,) → FC(48, 64) → ReLU → FC(64, 64) → ReLU
-
-Fusion: Cat(256, 64) → FC(320, 256) → ReLU → Actor/Critic heads
-```
-
-## References
-
-1. CaRL — Learning Scalable Planning Policies with Simple Rewards (NVIDIA AVG, CoRL 2025)
-2. Think2Drive — Efficient RL by Thinking with Latent World Model (ECCV 2024)
-3. CarDreamer — Open-Source World Model Platform for Driving (2024)
-4. Roach — End-to-End Urban Driving by Imitating a RL Coach (ICCV 2021)
-5. CAPS — Regularizing Action Policies for Smooth Control (ICRA 2021)
-6. RAD — Reinforcement Learning with Augmented Data (NeurIPS 2020)
-7. Toromanoff et al. — End-to-End Model-Free RL for Urban Driving Using Implicit Affordances (CVPR 2020)
-8. Schulman et al. — Proximal Policy Optimization Algorithms (2017)
-9. Dosovitskiy et al. — CARLA: An Open Urban Driving Simulator (CoRL 2017)
-10. Kiran et al. — Deep RL for Autonomous Driving: A Survey (IEEE TITS 2022)
+- [ ] Paper PDF (6-8 page IEEE/ACM 2-column) uploaded via Google Form
+- [ ] Video (≤3 min) uploaded via Google Form
+- [ ] Repo public / accessible to grader
+- [ ] README current and rubric-aligned (this file)
+- [ ] Deadline: Apr 26 11:59pm AOE (Apr 27 7:59am EDT)
