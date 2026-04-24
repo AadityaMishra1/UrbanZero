@@ -1,0 +1,230 @@
+{
+  "timestamp": "2026-04-24T01:00:26.127313",
+  "args": {
+    "model": "/home/aadityamishra/urbanzero/checkpoints/bc_pretrain.zip",
+    "episodes": 20,
+    "port": 2000,
+    "seed": 1001,
+    "output": "/home/aadityamishra/urbanzero/eval/bc_final_20260424_0059.json",
+    "no_traffic": false,
+    "max_steps": 3000
+  },
+  "aggregate": {
+    "n_episodes": 20,
+    "model_path": "/home/aadityamishra/urbanzero/checkpoints/bc_pretrain.zip",
+    "wall_clock_s": 67.49707889556885,
+    "rc_mean": 0.07418473668638331,
+    "rc_median": 0.03635295305062393,
+    "rc_max": 0.3293192724433186,
+    "rc_min": 0.0004553170137434971,
+    "rc_std": 0.08844378838995573,
+    "pct_route_complete": 0.0,
+    "pct_collision": 75.0,
+    "pct_off_route": 25.0,
+    "pct_really_stuck": 0.0,
+    "pct_max_steps": 0.0,
+    "avg_speed_ms": 5.3696020195353045
+  },
+  "episodes": [
+    {
+      "index": 0,
+      "steps": 127,
+      "duration_s": 6.3500000000000005,
+      "route_completion": 0.06446973630890047,
+      "termination_reason": "COLLISION",
+      "total_reward": -98.94624486967223,
+      "collisions": 1,
+      "avg_speed_ms": 6.30576548010752
+    },
+    {
+      "index": 1,
+      "steps": 184,
+      "duration_s": 9.200000000000001,
+      "route_completion": 0.024091214288092234,
+      "termination_reason": "COLLISION",
+      "total_reward": -98.87735318148043,
+      "collisions": 1,
+      "avg_speed_ms": 6.568743502816527
+    },
+    {
+      "index": 2,
+      "steps": 207,
+      "duration_s": 10.350000000000001,
+      "route_completion": 0.05400089419209398,
+      "termination_reason": "COLLISION",
+      "total_reward": -59.30419565307511,
+      "collisions": 1,
+      "avg_speed_ms": 6.190442329032742
+    },
+    {
+      "index": 3,
+      "steps": 712,
+      "duration_s": 35.6,
+      "route_completion": 0.0004553170137434971,
+      "termination_reason": "COLLISION",
+      "total_reward": -189.92393865677877,
+      "collisions": 1,
+      "avg_speed_ms": 0.8585583319505365
+    },
+    {
+      "index": 4,
+      "steps": 868,
+      "duration_s": 43.400000000000006,
+      "route_completion": 0.03569825214553184,
+      "termination_reason": "COLLISION",
+      "total_reward": -116.49915599688347,
+      "collisions": 1,
+      "avg_speed_ms": 2.067769350738484
+    },
+    {
+      "index": 5,
+      "steps": 233,
+      "duration_s": 11.65,
+      "route_completion": 0.2746365274764429,
+      "termination_reason": "COLLISION",
+      "total_reward": -97.19899938099661,
+      "collisions": 1,
+      "avg_speed_ms": 6.521998325108001
+    },
+    {
+      "index": 6,
+      "steps": 423,
+      "duration_s": 21.150000000000002,
+      "route_completion": 0.027484705519261306,
+      "termination_reason": "OFF_ROUTE",
+      "total_reward": -47.01531491128753,
+      "collisions": 0,
+      "avg_speed_ms": 6.375274848548388
+    },
+    {
+      "index": 7,
+      "steps": 373,
+      "duration_s": 18.650000000000002,
+      "route_completion": 0.03442815600001899,
+      "termination_reason": "OFF_ROUTE",
+      "total_reward": -47.2302839683216,
+      "collisions": 0,
+      "avg_speed_ms": 7.029259744146403
+    },
+    {
+      "index": 8,
+      "steps": 192,
+      "duration_s": 9.600000000000001,
+      "route_completion": 0.0997803025745847,
+      "termination_reason": "COLLISION",
+      "total_reward": -97.76291208548355,
+      "collisions": 1,
+      "avg_speed_ms": 7.257776815678358
+    },
+    {
+      "index": 9,
+      "steps": 309,
+      "duration_s": 15.450000000000001,
+      "route_completion": 0.03700765395571602,
+      "termination_reason": "COLLISION",
+      "total_reward": -63.442648252213985,
+      "collisions": 1,
+      "avg_speed_ms": 6.837662667149424
+    },
+    {
+      "index": 10,
+      "steps": 118,
+      "duration_s": 5.9,
+      "route_completion": 0.009884550823397504,
+      "termination_reason": "COLLISION",
+      "total_reward": -47.159675405427265,
+      "collisions": 1,
+      "avg_speed_ms": 5.3077842659960375
+    },
+    {
+      "index": 11,
+      "steps": 197,
+      "duration_s": 9.850000000000001,
+      "route_completion": 0.2087382195477855,
+      "termination_reason": "COLLISION",
+      "total_reward": -96.32920665061101,
+      "collisions": 1,
+      "avg_speed_ms": 6.938872810949722
+    },
+    {
+      "index": 12,
+      "steps": 117,
+      "duration_s": 5.8500000000000005,
+      "route_completion": 0.008971332049450548,
+      "termination_reason": "COLLISION",
+      "total_reward": -99.78752772882581,
+      "collisions": 1,
+      "avg_speed_ms": 5.308911675864834
+    },
+    {
+      "index": 13,
+      "steps": 484,
+      "duration_s": 24.200000000000003,
+      "route_completion": 0.02680785297102376,
+      "termination_reason": "OFF_ROUTE",
+      "total_reward": -86.12116839820283,
+      "collisions": 0,
+      "avg_speed_ms": 2.695866863604898
+    },
+    {
+      "index": 14,
+      "steps": 86,
+      "duration_s": 4.3,
+      "route_completion": 0.053354747511772445,
+      "termination_reason": "COLLISION",
+      "total_reward": -99.04123349348083,
+      "collisions": 1,
+      "avg_speed_ms": 5.981893597492369
+    },
+    {
+      "index": 15,
+      "steps": 284,
+      "duration_s": 14.200000000000001,
+      "route_completion": 0.02917786411708691,
+      "termination_reason": "OFF_ROUTE",
+      "total_reward": -48.09064895490883,
+      "collisions": 0,
+      "avg_speed_ms": 7.031677512084026
+    },
+    {
+      "index": 16,
+      "steps": 495,
+      "duration_s": 24.75,
+      "route_completion": 0.3293192724433186,
+      "termination_reason": "COLLISION",
+      "total_reward": -92.57398223987548,
+      "collisions": 1,
+      "avg_speed_ms": 7.376856852115818
+    },
+    {
+      "index": 17,
+      "steps": 455,
+      "duration_s": 22.75,
+      "route_completion": 0.09374646036075826,
+      "termination_reason": "OFF_ROUTE",
+      "total_reward": -81.6509578493467,
+      "collisions": 0,
+      "avg_speed_ms": 3.1369222309879667
+    },
+    {
+      "index": 18,
+      "steps": 120,
+      "duration_s": 6.0,
+      "route_completion": 0.014348154929216657,
+      "termination_reason": "COLLISION",
+      "total_reward": -99.75205547499354,
+      "collisions": 1,
+      "avg_speed_ms": 6.3182881929689225
+    },
+    {
+      "index": 19,
+      "steps": 699,
+      "duration_s": 34.95,
+      "route_completion": 0.057293519499470175,
+      "termination_reason": "COLLISION",
+      "total_reward": -178.21780618216144,
+      "collisions": 1,
+      "avg_speed_ms": 1.281714993365113
+    }
+  ]
+}
