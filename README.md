@@ -22,17 +22,37 @@ Critical context, in priority order:
    per-run failure analysis with citations, pre-registered
    falsification criteria, paper references. Read this first.
 2. **`eval/bc_final_20260424_0059.json`** — the final result.
-3. **`DIAGNOSIS_FOR_REVIEW.md`** — self-contained technical
+3. **`docs/COURSE_REQUIREMENTS.md`** — verbatim course rubrics,
+   hard requirements, and submission mechanics reproduced from
+   the private NCSU course repo so this project is self-contained.
+4. **`DIAGNOSIS_FOR_REVIEW.md`** — self-contained technical
    briefing prepared for an external ML/RL reviewer; includes
    reward function, hyperparameters, all 6 run beacons, paper
    citations.
-4. **GitHub Issues #1-#13** — per-iteration data + diagnostics.
+5. **GitHub Issues #1-#13** — per-iteration data + diagnostics.
    Issue #13 (closed) documents the root cause discovery.
-5. **`PC_CLAUDE_FINAL_BC_EVAL.md`** + others — the paste blocks
-   used to direct the PC-side agent that ran training/eval.
+6. **`PC_CLAUDE_FINAL_BC_EVAL.md`** + other `PC_CLAUDE_*.md` —
+   the paste blocks used to direct the PC-side agent that ran
+   training/eval (historical record of the iteration loop).
 
 The remaining work to ship the course deliverable is in the
 "What's Outstanding" section below.
+
+### What is NOT in this repo
+
+For full transparency for any agent picking this up:
+
+- **`bc_pretrain.zip`** (the trained BC model) lives at
+  `~/urbanzero/checkpoints/bc_pretrain.zip` on the training PC,
+  not in this git repo (~10 MB). Re-creatable from the BC training
+  pipeline (`scripts/run_bc_pipeline.sh`).
+- **Full training logs** (`~/urbanzero/logs/`) live on the PC.
+  Relevant beacon snapshots from the 6 failed runs are embedded
+  in `PROJECT_NOTES.md §11` and in GitHub Issues #7-#11.
+- **Raw BC dataset .npz** files (~140 MB) are on the PC.
+- **Paper PDF + LaTeX source** — not yet written. See "What's
+  Outstanding" below.
+- **Video MP4** — not yet recorded.
 
 ---
 
