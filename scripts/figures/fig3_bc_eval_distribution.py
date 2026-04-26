@@ -96,11 +96,7 @@ ax2.set_title("(b) Histogram of per-episode RC", fontsize=10)
 ax2.grid(axis="y", linestyle=":", alpha=0.3)
 ax2.legend(loc="upper right", fontsize=8)
 
-fig.suptitle(
-    "Figure 3. Frozen BC policy, deterministic eval "
-    "(20 episodes, seed 1001, Town01, dynamic NPCs).",
-    fontsize=10.5, y=1.02,
-)
+# Suptitle removed — LaTeX caption handles figure numbering and description.
 
 plt.tight_layout()
 out = os.path.join(OUT_DIR, "fig3_bc_eval_distribution.png")

@@ -70,8 +70,7 @@ ax.set_xticks(xpos)
 ax.set_xticklabels(labels, rotation=0, fontsize=9)
 ax.set_ylabel("Final rolling route completion (%)", fontsize=10)
 ax.set_xlabel("Training run (in chronological order)", fontsize=10)
-ax.set_title("Figure 1. Six training runs — final rolling route "
-             "completion by configuration", fontsize=10.5)
+# Title removed — LaTeX caption handles figure numbering and description.
 ax.set_ylim(0, 9.5)
 ax.grid(axis="y", linestyle=":", alpha=0.3)
 

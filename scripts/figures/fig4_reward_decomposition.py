@@ -95,8 +95,7 @@ ax2.text(0.02, 0.04,
          transform=ax2.transAxes, fontsize=8, color="#555555",
          bbox=dict(facecolor="white", edgecolor="#cccccc", pad=3))
 
-fig.suptitle("Figure 4. Final reward profile — term magnitudes and "
-             "per-step economics.", fontsize=10.5, y=1.02)
+# Suptitle removed — LaTeX caption handles figure numbering and description.
 
 plt.tight_layout()
 out = os.path.join(OUT_DIR, "fig4_reward_decomposition.png")

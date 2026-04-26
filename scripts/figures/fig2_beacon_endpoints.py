@@ -87,8 +87,7 @@ ax.set_ylabel("Rolling avg ego speed (m/s)", fontsize=9.5)
 ax.set_title("(c) Average ego speed at endpoint", fontsize=10)
 ax.grid(axis="y", linestyle=":", alpha=0.3)
 
-fig.suptitle("Figure 2. Beacon endpoints across the six training runs.",
-             fontsize=10.5, y=1.02)
+# Suptitle removed — LaTeX caption handles figure numbering and description.
 
 plt.tight_layout()
 out = os.path.join(OUT_DIR, "fig2_beacon_endpoints.png")
